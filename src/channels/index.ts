@@ -8,3 +8,14 @@
 
 import './cli.js';
 import './telegram.js';
+
+// discord
+
+// gmail
+
+// slack
+
+// whatsapp
+
+// emacs
+import './emacs.js';
