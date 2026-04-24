@@ -27,6 +27,7 @@ import { getDb, hasTable } from './db/connection.js';
 import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
+import { readEnvFile } from './env.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
 // Provider host-side config barrel — each provider that needs host-side
 // container setup self-registers on import.
@@ -408,6 +409,9 @@ async function buildContainerArgs(
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
   args.push('-e', `TZ=${TIMEZONE}`);
 
+  // Claude OAuth token — read from .env so it never touches process.env.
+  // Claude Code picks this up automatically when present.
+  const { CLAUDE_CODE_OAUTH_TOKEN } = readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN']);
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   if (providerContribution.env) {
     for (const [key, value] of Object.entries(providerContribution.env)) {
@@ -429,6 +433,14 @@ async function buildContainerArgs(
     }
   } catch (err) {
     log.warn('OneCLI gateway error — container will have no credentials', { containerName, err });
+  }
+
+  // Claude OAuth token — added after OneCLI so it overrides the ANTHROPIC_API_KEY=placeholder
+  // that OneCLI injects. Docker uses the last value for duplicate env var names, so this wins.
+  // Clearing ANTHROPIC_API_KEY lets Claude Code fall through to CLAUDE_CODE_OAUTH_TOKEN.
+  if (CLAUDE_CODE_OAUTH_TOKEN) {
+    args.push('-e', 'ANTHROPIC_API_KEY=');
+    args.push('-e', `CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}`);
   }
 
   // Host gateway
