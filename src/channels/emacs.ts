@@ -111,7 +111,9 @@ export function createEmacsAdapter(): ChannelAdapter & { _server: http.Server | 
     name: 'emacs',
     channelType: CHANNEL_TYPE,
     supportsThreads: false,
-    get _server() { return server; },
+    get _server() {
+      return server;
+    },
 
     async setup(config: ChannelSetup): Promise<void> {
       setup = config;

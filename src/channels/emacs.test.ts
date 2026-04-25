@@ -80,7 +80,9 @@ function makeSetup(): { setup: ChannelSetup; onInbound: ReturnType<typeof vi.fn>
 }
 
 /** Create an emacs adapter with port 0 (OS picks a free port). */
-async function makeConnectedAdapter(authToken?: string): Promise<{ adapter: ChannelAdapter; setup: ChannelSetup; onInbound: ReturnType<typeof vi.fn> }> {
+async function makeConnectedAdapter(
+  authToken?: string,
+): Promise<{ adapter: ChannelAdapter; setup: ChannelSetup; onInbound: ReturnType<typeof vi.fn> }> {
   process.env.EMACS_CHANNEL_PORT = '0';
   if (authToken !== undefined) process.env.EMACS_AUTH_TOKEN = authToken;
   else delete process.env.EMACS_AUTH_TOKEN;
@@ -269,9 +271,13 @@ function emacsAvailable(): boolean {
 function mdToOrg(input: string): string {
   const elFile = path.resolve('emacs/nanoclaw.el');
   const escaped = input.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
-  return execFileSync('emacs', ['--batch', '--load', elFile, '--eval', `(princ (nanoclaw--md-to-org-regex "${escaped}"))`], {
-    encoding: 'utf8',
-  });
+  return execFileSync(
+    'emacs',
+    ['--batch', '--load', elFile, '--eval', `(princ (nanoclaw--md-to-org-regex "${escaped}"))`],
+    {
+      encoding: 'utf8',
+    },
+  );
 }
 
 describe.skipIf(!emacsAvailable())('nanoclaw--md-to-org-regex', () => {
