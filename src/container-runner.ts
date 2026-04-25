@@ -412,7 +412,11 @@ async function buildContainerArgs(
 
   // Claude OAuth token — read from .env so it never touches process.env.
   // Claude Code picks this up automatically when present.
-  const { CLAUDE_CODE_OAUTH_TOKEN } = readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN']);
+  const { CLAUDE_CODE_OAUTH_TOKEN, GITHUB_TOKEN, CONTAINER_PASSTHROUGH } = readEnvFile([
+    'CLAUDE_CODE_OAUTH_TOKEN',
+    'GITHUB_TOKEN',
+    'CONTAINER_PASSTHROUGH',
+  ]);
 
   // Forward Ollama admin tools flag if enabled
   if (OLLAMA_ADMIN_TOOLS) {
@@ -448,6 +452,28 @@ async function buildContainerArgs(
   if (CLAUDE_CODE_OAUTH_TOKEN) {
     args.push('-e', 'ANTHROPIC_API_KEY=');
     args.push('-e', `CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}`);
+  }
+
+  // GitHub token — injected as both GH_TOKEN (gh CLI) and GITHUB_TOKEN (git tooling, Actions).
+  // The OneCLI proxy injects this as a Bearer header for API calls, but git HTTPS auth requires
+  // Basic auth; having the raw token as an env var lets the agent configure git credentials directly.
+  if (GITHUB_TOKEN) {
+    args.push('-e', `GITHUB_TOKEN=${GITHUB_TOKEN}`);
+    args.push('-e', `GH_TOKEN=${GITHUB_TOKEN}`);
+  }
+
+  // Generic passthrough: CONTAINER_PASSTHROUGH=VAR1,VAR2 in .env forwards those vars to every container.
+  // Add new API keys here without touching this code — just update .env.
+  if (CONTAINER_PASSTHROUGH) {
+    const passthroughKeys = CONTAINER_PASSTHROUGH.split(',')
+      .map((k) => k.trim())
+      .filter(Boolean);
+    const passthroughVals = readEnvFile(passthroughKeys);
+    for (const key of passthroughKeys) {
+      if (passthroughVals[key]) {
+        args.push('-e', `${key}=${passthroughVals[key]}`);
+      }
+    }
   }
 
   // Host gateway
