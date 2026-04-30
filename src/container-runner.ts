@@ -316,6 +316,25 @@ function buildMounts(
     mounts.push(...validated);
   }
 
+  // Privileged mounts — explicitly bypass mount-security so they land at
+  // their specified absolute container paths (e.g. /var/run/docker.sock).
+  // No allowlist check, no /workspace/extra/ prefix. Documented in
+  // container-config.ts; the user opts in by editing container.json directly.
+  if (containerConfig.privilegedMounts && containerConfig.privilegedMounts.length > 0) {
+    for (const m of containerConfig.privilegedMounts) {
+      mounts.push({
+        hostPath: m.hostPath,
+        containerPath: m.containerPath,
+        readonly: m.readonly ?? false,
+      });
+    }
+    log.warn('Privileged mounts active (mount-security bypassed)', {
+      group: agentGroup.name,
+      count: containerConfig.privilegedMounts.length,
+      paths: containerConfig.privilegedMounts.map((m) => `${m.hostPath} → ${m.containerPath}`),
+    });
+  }
+
   // Provider-contributed mounts (e.g. opencode-xdg)
   if (providerContribution.mounts) {
     mounts.push(...providerContribution.mounts);
@@ -504,6 +523,25 @@ async function buildContainerArgs(
   if (hostUid != null && hostUid !== 0 && hostUid !== 1000) {
     args.push('--user', `${hostUid}:${hostGid}`);
     args.push('-e', 'HOME=/home/node');
+  }
+
+  // Auto-derive supplementary groups from privileged mounts. Each privileged
+  // mount file may be owned by a host group (e.g. /var/run/docker.sock is
+  // owned by gid=docker). Add that gid as --group-add so the container
+  // process can read/write the socket without changing user.
+  if (containerConfig.privilegedMounts && containerConfig.privilegedMounts.length > 0) {
+    const gids = new Set<number>();
+    for (const m of containerConfig.privilegedMounts) {
+      try {
+        const stat = fs.statSync(m.hostPath);
+        if (stat.gid !== 0) gids.add(stat.gid);
+      } catch (err) {
+        log.warn('Could not stat privileged mount for gid', { hostPath: m.hostPath, err });
+      }
+    }
+    for (const gid of gids) {
+      args.push('--group-add', String(gid));
+    }
   }
 
   // Volume mounts

@@ -35,6 +35,13 @@ export interface ContainerConfig {
   packages: { apt: string[]; npm: string[] };
   imageTag?: string;
   additionalMounts: AdditionalMountConfig[];
+  /**
+   * Privileged mounts — bypass mount-security (no /workspace/extra/ prefix,
+   * no allowlist check). Use only for paths that must land at a specific
+   * absolute location inside the container (e.g. /var/run/docker.sock).
+   * Each entry grants the container the same access the host has at that path.
+   */
+  privilegedMounts?: AdditionalMountConfig[];
   /** Which skills to enable — array of skill names or "all" (default). */
   skills: string[] | 'all';
   /** Agent provider name (e.g. "claude", "opencode"). Default: "claude". */
@@ -81,6 +88,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
       },
       imageTag: raw.imageTag,
       additionalMounts: raw.additionalMounts ?? [],
+      privilegedMounts: raw.privilegedMounts,
       skills: raw.skills ?? 'all',
       provider: raw.provider,
       groupName: raw.groupName,
