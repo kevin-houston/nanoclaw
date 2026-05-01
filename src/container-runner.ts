@@ -10,6 +10,7 @@ import path from 'path';
 import { OneCLI } from '@onecli-sh/sdk';
 
 import {
+  CONTAINER_ENV_PASSTHROUGH,
   CONTAINER_IMAGE,
   CONTAINER_IMAGE_BASE,
   CONTAINER_INSTALL_LABEL,
@@ -19,6 +20,7 @@ import {
   ONECLI_URL,
   TIMEZONE,
 } from './config.js';
+import { readEnvFile } from './env.js';
 import { readContainerConfig, writeContainerConfig } from './container-config.js';
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
@@ -443,6 +445,18 @@ async function buildContainerArgs(
   if (providerContribution.env) {
     for (const [key, value] of Object.entries(providerContribution.env)) {
       args.push('-e', `${key}=${value}`);
+    }
+  }
+
+  // Forward additional env vars listed in CONTAINER_ENV_PASSTHROUGH from .env.
+  // Use this for non-secret config that OneCLI vault doesn't manage (e.g. URLs).
+  // For real secrets, prefer the OneCLI vault.
+  if (CONTAINER_ENV_PASSTHROUGH.length > 0) {
+    const passthroughValues = readEnvFile(CONTAINER_ENV_PASSTHROUGH);
+    for (const key of CONTAINER_ENV_PASSTHROUGH) {
+      if (passthroughValues[key]) {
+        args.push('-e', `${key}=${passthroughValues[key]}`);
+      }
     }
   }
 

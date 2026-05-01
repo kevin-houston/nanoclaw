@@ -10,7 +10,17 @@
 # bind mount at runtime (see src/container-runner.ts). Source-only changes
 # never require an image rebuild.
 
+# Stage 1: Python 3.13, glibc-2.36-compatible (Debian Bookworm).
+FROM python:3.13-slim-bookworm AS python313
+
+# Stage 2: main agent container.
 FROM node:22-slim
+
+# Copy Python 3.13 binary, stdlib, and shared library from the python:3.13-slim-bookworm stage.
+COPY --from=python313 /usr/local/bin/python3.13 /usr/local/bin/python3.13
+COPY --from=python313 /usr/local/lib/python3.13 /usr/local/lib/python3.13
+COPY --from=python313 /usr/local/lib/libpython3.13.so.1.0 /usr/local/lib/libpython3.13.so.1.0
+RUN ldconfig
 
 # ---- Build-time arguments ----------------------------------------------------
 # CJK fonts add ~200MB. Opt in only if you render Chinese/Japanese/Korean text.
@@ -51,6 +61,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         git \
         tini \
         unzip \
+        ffmpeg \
     && if [ "$INSTALL_CJK_FONTS" = "true" ]; then \
         apt-get install -y --no-install-recommends fonts-noto-cjk; \
        fi \
