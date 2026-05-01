@@ -472,6 +472,16 @@ async function buildContainerArgs(
   if (!onecliApplied) {
     throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
   }
+
+  // Claude OAuth token — injected after OneCLI so it overrides ANTHROPIC_API_KEY=placeholder.
+  // Docker uses the last value for duplicate env var names, so this wins. Clearing
+  // ANTHROPIC_API_KEY lets Claude Code fall through to CLAUDE_CODE_OAUTH_TOKEN.
+  // Required for Pro/Max OAuth tokens (sk-ant-oat01-…) which can't authenticate via x-api-key.
+  const { CLAUDE_CODE_OAUTH_TOKEN } = readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN']);
+  if (CLAUDE_CODE_OAUTH_TOKEN) {
+    args.push('-e', 'ANTHROPIC_API_KEY=');
+    args.push('-e', `CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}`);
+  }
   log.info('OneCLI gateway applied', { containerName });
 
   // Host gateway
