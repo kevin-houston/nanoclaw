@@ -1,5 +1,19 @@
 # 02 — OAuth direct passing (replace credential proxy server)
 
+> **v2 update (applied 2026-05-01):** This document was originally written for v1, where the customization was to gut the `native-credential-proxy` skill's HTTP server. v2 retired that skill in favor of OneCLI Vault. The same auth problem still exists — OneCLI's vault secrets inject as `x-api-key` headers, which OAuth tokens (`sk-ant-oat01-…`) cannot use — so a smaller v2-shaped variant was applied to `src/container-runner.ts`: read `CLAUDE_CODE_OAUTH_TOKEN` from `.env` after `onecli.applyContainerConfig`, then push `-e ANTHROPIC_API_KEY=` and `-e CLAUDE_CODE_OAUTH_TOKEN=…` so Docker's last-wins env semantics override OneCLI's placeholder. See commit `fe18ce9`. The original v1 procedure below is kept for historical reference.
+>
+> **v2 minimal patch:**
+> ```typescript
+> // After onecli.applyContainerConfig(...) in buildContainerArgs:
+> const { CLAUDE_CODE_OAUTH_TOKEN } = readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN']);
+> if (CLAUDE_CODE_OAUTH_TOKEN) {
+>   args.push('-e', 'ANTHROPIC_API_KEY=');
+>   args.push('-e', `CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}`);
+> }
+> ```
+
+---
+
 **Apply when:** Skill `upstream/skill/native-credential-proxy` has been merged AND the cross-skill dedup in `01-skill-interactions.md` is done.
 
 **Why:** The native-credential-proxy skill stands up an HTTP server that intercepts `https://api.anthropic.com` and rewrites credentials. With long-lived OAuth tokens (`CLAUDE_CODE_OAUTH_TOKEN`) that lack the `org:create_api_key` scope, the proxy's token-exchange flow fails and the SDK reports "Not logged in." The user replaced the proxy with direct credential injection: containers receive `CLAUDE_CODE_OAUTH_TOKEN` (or `ANTHROPIC_API_KEY`) as real environment variables, and the Claude Code SDK handles auth natively.
