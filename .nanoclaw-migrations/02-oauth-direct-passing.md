@@ -1,18 +1,58 @@
 # 02 — OAuth direct passing (replace credential proxy server)
 
-> **v2 update (applied 2026-05-01):** This document was originally written for v1, where the customization was to gut the `native-credential-proxy` skill's HTTP server. v2 retired that skill in favor of OneCLI Vault. The same auth problem still exists — OneCLI's vault secrets inject as `x-api-key` headers, which OAuth tokens (`sk-ant-oat01-…`) cannot use — so a smaller v2-shaped variant was applied to `src/container-runner.ts`: read `CLAUDE_CODE_OAUTH_TOKEN` from `.env` after `onecli.applyContainerConfig`, then push `-e ANTHROPIC_API_KEY=` and `-e CLAUDE_CODE_OAUTH_TOKEN=…` so Docker's last-wins env semantics override OneCLI's placeholder. See commit `fe18ce9`. The original v1 procedure below is kept for historical reference.
+> **v2 final (applied 2026-05-02):** Three things together are required for OAuth to work in v2 — a single one is necessary but not sufficient. The original v1 procedure (gutting native-credential-proxy) is preserved at the bottom for historical reference; the v2-final pattern that actually works is documented here.
 >
-> **v2 minimal patch:**
-> ```typescript
-> // After onecli.applyContainerConfig(...) in buildContainerArgs:
-> const { CLAUDE_CODE_OAUTH_TOKEN } = readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN']);
-> if (CLAUDE_CODE_OAUTH_TOKEN) {
->   args.push('-e', 'ANTHROPIC_API_KEY=');
->   args.push('-e', `CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}`);
-> }
-> ```
+> ### v2-final pattern
+>
+> 1. **Code change in `src/container-runner.ts`** — inject `CLAUDE_CODE_OAUTH_TOKEN` after `onecli.applyContainerConfig`, so Docker's last-wins env semantics override OneCLI's `ANTHROPIC_API_KEY=placeholder`. Commit `fe18ce9`.
+>
+>    ```typescript
+>    // After onecli.applyContainerConfig(...) in buildContainerArgs:
+>    const { CLAUDE_CODE_OAUTH_TOKEN } = readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN']);
+>    if (CLAUDE_CODE_OAUTH_TOKEN) {
+>      args.push('-e', 'ANTHROPIC_API_KEY=');
+>      args.push('-e', `CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}`);
+>    }
+>    ```
+>
+> 2. **Per-agent OneCLI vault must NOT auto-inject `x-api-key`.** With `secretMode: all`, OneCLI's gateway adds an `x-api-key` header to every `api.anthropic.com` request from the agent's vault entry — Anthropic prefers `x-api-key` over `Authorization: Bearer`, so the OAuth token gets ignored. Switch the agent to `selective` (no secrets) so the proxy passes the Bearer token through cleanly:
+>
+>    ```bash
+>    # one-time per agent
+>    onecli agents set-secret-mode --id <agent-id> --mode selective
+>    # If you later want to inject vault secrets for non-Anthropic services,
+>    # use `onecli agents set-secrets --id <agent-id> --secret-ids <id1>,<id2>`
+>    # but make sure the Anthropic API secret is NOT in that list.
+>    ```
+>
+> 3. **Token rotation.** `CLAUDE_CODE_OAUTH_TOKEN` must be a `/login`-issued OAuth access token — those have `user:profile` scope, which Claude Code CLI's startup validation requires. Tokens from `claude setup-token` lack that scope and fail with "Not logged in." `/login`-issued accessTokens expire in ~7-8h, but Claude Code refreshes `~/.claude/.credentials.json` automatically while logged in. Use the cron-driven rotation script:
+>
+>    ```
+>    scripts/rotate-claude-token.sh
+>    ```
+>
+>    Cron entry:
+>    ```
+>    0 */5 * * * /home/kevin/nc/nc2/nanoclaw/scripts/rotate-claude-token.sh >> /home/kevin/nc/nc2/nanoclaw/logs/token-rotation.log 2>&1
+>    ```
+>
+>    The script reads `claudeAiOauth.accessToken` from `~/.claude/.credentials.json`, writes it to `.env` + `data/env/env`, and kills the install's running container (filtered by `nanoclaw-install=<slug>` label) so the next message spawns fresh.
+>
+> ### Failure modes if any single piece is missing
+>
+> - **Code change missing:** OneCLI's `ANTHROPIC_API_KEY=placeholder` wins. Vault `x-api-key` injection still happens. If vault has a valid API key → works on API key auth (no OAuth needed). If vault has no key or stale key → "Invalid API key."
+> - **Vault still on `mode: all`:** OAuth Bearer auth and vault `x-api-key` injection collide. Result: "Not logged in" or "Invalid API key" depending on the vault key validity.
+> - **Token from `claude setup-token`:** Inference works (`/v1/messages` accepts the token), but Claude Code CLI's startup profile lookup at `/api/oauth/profile` fails with `permission_error: OAuth token does not meet scope requirement any_of(user:profile, user:office)`. Result: "Not logged in." Only `/login` browser-flow tokens have `user:profile`.
+> - **Stale `continuation:claude` in `session_state`:** When you change auth config, existing Claude Code sessions cached on disk inside the container's `~/.claude/projects/<group>/<session-id>.jsonl` may carry stale state. After any auth-config change, clear the row: `sqlite3 data/v2-sessions/<agent-group>/sess-<sess>/outbound.db "DELETE FROM session_state WHERE key='continuation:claude';"` and kill the running container — next message starts fresh.
+>
+> ### Trade-off
+>
+> This pattern requires the operator to stay logged in via Claude Code CLI on this host. If `claude` isn't run for an extended period, `~/.claude/.credentials.json` won't refresh and the rotation script will copy an expired token. To recover, run `claude` interactively once (any command will trigger a refresh, e.g. `claude --print "ping"`).
 
 ---
+
+## Original v1 procedure (kept for historical reference)
+
 
 **Apply when:** Skill `upstream/skill/native-credential-proxy` has been merged AND the cross-skill dedup in `01-skill-interactions.md` is done.
 
