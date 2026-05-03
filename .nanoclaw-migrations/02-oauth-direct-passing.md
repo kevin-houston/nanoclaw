@@ -1,6 +1,8 @@
 # 02 — OAuth direct passing (replace credential proxy server)
 
-> **v2 final (applied 2026-05-02):** Three things together are required for OAuth to work in v2 — a single one is necessary but not sufficient. The original v1 procedure (gutting native-credential-proxy) is preserved at the bottom for historical reference; the v2-final pattern that actually works is documented here.
+> **v2 final (applied 2026-05-03):** Two things are required for OAuth-direct-passing to work in v2. Earlier revisions of this doc claimed three things were required including periodic token rotation — that turned out to be wrong. The actual root cause was the OneCLI vault auto-injecting an invalid `x-api-key` header that overrode the Bearer auth. Once `secretMode: selective` is set on the agent, any `oat01`-style OAuth token works, including long-lived `claude setup-token` tokens that don't expire. No rotation needed.
+>
+> The original v1 procedure (gutting native-credential-proxy) is preserved at the bottom for historical reference; the v2-final pattern is documented here.
 >
 > ### v2-final pattern
 >
@@ -15,7 +17,7 @@
 >    }
 >    ```
 >
-> 2. **Per-agent OneCLI vault must NOT auto-inject `x-api-key`.** With `secretMode: all`, OneCLI's gateway adds an `x-api-key` header to every `api.anthropic.com` request from the agent's vault entry — Anthropic prefers `x-api-key` over `Authorization: Bearer`, so the OAuth token gets ignored. Switch the agent to `selective` (no secrets) so the proxy passes the Bearer token through cleanly:
+> 2. **Per-agent OneCLI vault must NOT auto-inject `x-api-key` for `api.anthropic.com`.** With `secretMode: all`, OneCLI's gateway adds an `x-api-key` header to every `api.anthropic.com` request based on whatever the vault has stored under "Anthropic API". Anthropic prefers `x-api-key` over `Authorization: Bearer` when both are present, so the OAuth token gets ignored — and if the vault value is wrong/empty/expired, the request fails. Switch the agent to `selective` (no secrets, or no Anthropic-related secrets) so the proxy passes the Bearer token through cleanly:
 >
 >    ```bash
 >    # one-time per agent
@@ -25,29 +27,32 @@
 >    # but make sure the Anthropic API secret is NOT in that list.
 >    ```
 >
-> 3. **Token rotation.** `CLAUDE_CODE_OAUTH_TOKEN` must be a `/login`-issued OAuth access token — those have `user:profile` scope, which Claude Code CLI's startup validation requires. Tokens from `claude setup-token` lack that scope and fail with "Not logged in." `/login`-issued accessTokens expire in ~7-8h, but Claude Code refreshes `~/.claude/.credentials.json` automatically while logged in. Use the cron-driven rotation script:
+> ### Token requirements
 >
+> The token in `.env`'s `CLAUDE_CODE_OAUTH_TOKEN` must:
+>
+> - Be in `sk-ant-oat01-…` shape (Anthropic OAuth)
+> - Be valid for `/v1/messages` (test: `curl -H "Authorization: Bearer $TOKEN" -H "anthropic-version: 2023-06-01" -H "anthropic-beta: oauth-2025-04-20" -X POST https://api.anthropic.com/v1/messages -d '{"model":"claude-haiku-4-5","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}'` → HTTP 200)
+>
+> The token does **not** need `user:profile` scope. Claude Code CLI's startup may fail validation against `/api/oauth/profile` if the token lacks that scope, but in the agent-runner's invocation path that check doesn't gate inference — Claude Code uses the token for `/v1/messages` which only requires `user:inference`. (Earlier revisions of this doc incorrectly diagnosed the failure mode as a profile-scope issue. The actual issue was item 2 above — the vault's bad `x-api-key` injection.)
+>
+> Two practical token sources, both work:
+>
+> - **`claude setup-token`** — long-lived, doesn't expire, no `user:profile` scope, ideal for headless. **Recommended.**
+> - **Active `~/.claude/.credentials.json`'s `claudeAiOauth.accessToken`** — has `user:profile` scope but expires in ~7-8h, refreshes when Claude Code is used on the host. Works fine but requires periodic rotation if you want it to stay in `.env` long-term. The companion script `scripts/rotate-claude-token.sh` automates this if needed.
+>
+> ### Failure modes
+>
+> - **Vault still on `mode: all`:** OAuth Bearer auth and vault `x-api-key` injection collide. Result: "Not logged in" or "Invalid API key" depending on the vault key validity. **Fix:** `onecli agents set-secret-mode --id <agent-id> --mode selective`
+> - **Code change missing:** OneCLI's `ANTHROPIC_API_KEY=placeholder` wins; OAuth token is ignored. If vault has a valid API key → works on API-key auth. Otherwise → "Invalid API key."
+> - **Token expired or wrong shape:** Direct `curl` test (above) returns 401 or other auth error. **Fix:** generate a fresh setup-token (`claude setup-token`) and replace `.env`'s value.
+> - **Stale `continuation:claude` in `session_state`:** When you change auth config, existing Claude Code sessions cached in the container's `~/.claude/projects/<group>/<session-id>.jsonl` may carry stale state. After any auth-config change, clear the row and restart the container:
+>
+>    ```bash
+>    sqlite3 data/v2-sessions/<agent-group>/sess-*/outbound.db \
+>      "DELETE FROM session_state WHERE key='continuation:claude';"
+>    docker kill $(docker ps --filter "label=nanoclaw-install=<slug>" --format '{{.ID}}')
 >    ```
->    scripts/rotate-claude-token.sh
->    ```
->
->    Cron entry:
->    ```
->    0 */5 * * * /home/kevin/nc/nc2/nanoclaw/scripts/rotate-claude-token.sh >> /home/kevin/nc/nc2/nanoclaw/logs/token-rotation.log 2>&1
->    ```
->
->    The script reads `claudeAiOauth.accessToken` from `~/.claude/.credentials.json`, writes it to `.env` + `data/env/env`, and kills the install's running container (filtered by `nanoclaw-install=<slug>` label) so the next message spawns fresh.
->
-> ### Failure modes if any single piece is missing
->
-> - **Code change missing:** OneCLI's `ANTHROPIC_API_KEY=placeholder` wins. Vault `x-api-key` injection still happens. If vault has a valid API key → works on API key auth (no OAuth needed). If vault has no key or stale key → "Invalid API key."
-> - **Vault still on `mode: all`:** OAuth Bearer auth and vault `x-api-key` injection collide. Result: "Not logged in" or "Invalid API key" depending on the vault key validity.
-> - **Token from `claude setup-token`:** Inference works (`/v1/messages` accepts the token), but Claude Code CLI's startup profile lookup at `/api/oauth/profile` fails with `permission_error: OAuth token does not meet scope requirement any_of(user:profile, user:office)`. Result: "Not logged in." Only `/login` browser-flow tokens have `user:profile`.
-> - **Stale `continuation:claude` in `session_state`:** When you change auth config, existing Claude Code sessions cached on disk inside the container's `~/.claude/projects/<group>/<session-id>.jsonl` may carry stale state. After any auth-config change, clear the row: `sqlite3 data/v2-sessions/<agent-group>/sess-<sess>/outbound.db "DELETE FROM session_state WHERE key='continuation:claude';"` and kill the running container — next message starts fresh.
->
-> ### Trade-off
->
-> This pattern requires the operator to stay logged in via Claude Code CLI on this host. If `claude` isn't run for an extended period, `~/.claude/.credentials.json` won't refresh and the rotation script will copy an expired token. To recover, run `claude` interactively once (any command will trigger a refresh, e.g. `claude --print "ping"`).
 
 ---
 
