@@ -476,7 +476,10 @@ async function buildContainerArgs(
   // Claude OAuth token — injected after OneCLI so it overrides ANTHROPIC_API_KEY=placeholder.
   // Docker uses the last value for duplicate env var names, so this wins. Clearing
   // ANTHROPIC_API_KEY lets Claude Code fall through to CLAUDE_CODE_OAUTH_TOKEN.
-  // Required for Pro/Max OAuth tokens (sk-ant-oat01-…) which can't authenticate via x-api-key.
+  // Required because the OneCLI vault's x-api-key injection isn't a usable Claude API key.
+  // Token must come from a /login session (has user:profile scope) — `claude setup-token`
+  // tokens lack that scope and fail Claude Code CLI's startup validation. The companion
+  // script scripts/rotate-claude-token.sh keeps .env in sync with ~/.claude/.credentials.json.
   const { CLAUDE_CODE_OAUTH_TOKEN } = readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN']);
   if (CLAUDE_CODE_OAUTH_TOKEN) {
     args.push('-e', 'ANTHROPIC_API_KEY=');
