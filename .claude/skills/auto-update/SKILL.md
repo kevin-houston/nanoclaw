@@ -37,9 +37,13 @@ A previous `auto-update` run may have stashed and died before popping. Recover b
 
 If any matching entries exist:
 - Pick the **oldest** one (highest `stash@{N}` index among matches) — that is the longest-orphaned and most likely to be lost work.
-- Run `git stash show --name-only <ref>` and check whether any of those paths overlap with files currently dirty in the working tree (`git status --porcelain` paths). If they do, skip recovery for this run and surface as `ACTION NEEDED: orphan auto-update stash <ref> overlaps current dirty paths — resolve manually` in the summary.
-- If no overlap, run `git stash apply <ref>`. If the apply is clean (no conflict markers, exit 0), then `git stash drop <ref>` and record `Recovered orphan stash: <ref>` in the summary.
-- If the apply reports conflicts, run `git stash drop` is **not** safe — leave the stash and the conflict markers in place, abort this auto-update run, and surface `ACTION NEEDED: orphan stash <ref> applied with conflicts — resolve manually`.
+- Run `git stash show --name-only <ref>` and check overlap against:
+  - **Dirty tree paths** (`git status --porcelain`): would clobber unsaved work.
+  - **Tracked files at HEAD**: an untracked-stashed path may now exist as tracked (e.g. the skill file got committed since the stash was made). `git stash apply` will refuse with "already exists, no checkout" in that case.
+  - For each path in the stash, compare its content against the current file at the same path. If identical (`git show stash@{N}:<path>` matches the working tree file byte-for-byte), the stash is fully redundant — drop it directly with `git stash drop <ref>` and record `Dropped redundant orphan stash: <ref>` in the summary. No apply needed.
+- If any path in the stash overlaps a dirty path or a non-identical tracked path, skip recovery for this run and surface as `ACTION NEEDED: orphan auto-update stash <ref> overlaps current state — resolve manually` in the summary.
+- Otherwise (no overlap, no redundancy): run `git stash apply <ref>`. If the apply is clean (no conflict markers, exit 0), then `git stash drop <ref>` and record `Recovered orphan stash: <ref>` in the summary.
+- If the apply reports conflicts, leave the stash and the conflict markers in place, abort this auto-update run, and surface `ACTION NEEDED: orphan stash <ref> applied with conflicts — resolve manually`. Do **not** run `git stash drop`.
 - Repeat for any remaining matching stashes (oldest first), but stop at the first one that requires manual intervention.
 
 After recovery, the tree may now be dirty (with restored work). That is fine — Step 1 will stash it back under a fresh timestamp.
