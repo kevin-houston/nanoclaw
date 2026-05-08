@@ -1,74 +1,45 @@
-import fs from 'fs';
+/**
+ * Emacs channel adapter (v2) — native HTTP bridge.
+ *
+ * Stands up a localhost HTTP server that the nanoclaw.el client talks to:
+ *  - POST /api/message — user typed a message in Emacs; fire onInbound
+ *  - GET  /api/messages?since=<ms> — Emacs polls for agent replies
+ *
+ * Single-user, single-chat: one adapter instance = one messaging group with
+ * `platform_id = "default"` (override with EMACS_PLATFORM_ID). No threads,
+ * no cold DM. Self-registers on import.
+ */
 import http from 'http';
-import path from 'path';
 
-import { GROUPS_DIR } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
-import type { ChannelAdapter, ChannelSetup, OutboundMessage } from './adapter.js';
 import { registerChannelAdapter } from './channel-registry.js';
+import type { ChannelAdapter, ChannelSetup, InboundMessage, OutboundMessage } from './adapter.js';
 
-const PLATFORM_ID = 'emacs:default';
-const CHANNEL_TYPE = 'emacs';
+const OUTBOUND_BUFFER_MAX = 200;
 
 interface BufferedMessage {
   text: string;
   timestamp: number;
 }
 
-function extractText(message: OutboundMessage): string | null {
-  const content = message.content as Record<string, unknown> | string | undefined;
-  if (typeof content === 'string') return content;
-  if (content && typeof content === 'object' && typeof content.text === 'string') {
-    return content.text;
-  }
-  return null;
+interface EmacsAdapterOptions {
+  port: number;
+  authToken: string | null;
+  platformId: string;
 }
 
-function ensureClaudeMd(): void {
-  const claudeMd = path.join(GROUPS_DIR, 'emacs', 'CLAUDE.md');
-  if (fs.existsSync(claudeMd)) return;
-  const content = [
-    '## Message Formatting',
-    '',
-    'This is an Emacs channel. Responses are automatically converted from markdown',
-    'to org-mode by the bridge before display.',
-    '',
-    '**Always format responses in standard markdown:**',
-    '- `**bold**` not `*bold*`',
-    '- `*italic*` not `/italic/`',
-    '- `~~strikethrough~~` not `+strikethrough+`',
-    '- `` `code` `` not `~code~`',
-    '- ` ```lang ` fenced code blocks',
-    '- `- ` for bullet points',
-    '',
-    'Do NOT output org-mode syntax directly. The bridge handles conversion.',
-    '',
-  ].join('\n');
-  try {
-    fs.mkdirSync(path.dirname(claudeMd), { recursive: true });
-    fs.writeFileSync(claudeMd, content, 'utf8');
-    log.info('Emacs channel: wrote CLAUDE.md');
-  } catch (err) {
-    log.warn('Emacs channel: could not write CLAUDE.md', { err });
-  }
-}
-
-export function createEmacsAdapter(): ChannelAdapter & { _server: http.Server | null } {
+function createEmacsAdapter(opts: EmacsAdapterOptions): ChannelAdapter {
   let server: http.Server | null = null;
-  let buffer: BufferedMessage[] = [];
-  let setup: ChannelSetup | null = null;
-
-  const envVars = readEnvFile(['EMACS_CHANNEL_PORT', 'EMACS_AUTH_TOKEN']);
-  const portStr = process.env.EMACS_CHANNEL_PORT || envVars.EMACS_CHANNEL_PORT || '8766';
-  const port = parseInt(portStr, 10);
-  const authToken = process.env.EMACS_AUTH_TOKEN || envVars.EMACS_AUTH_TOKEN || null;
+  let setupConfig: ChannelSetup | null = null;
+  const outboundBuffer: BufferedMessage[] = [];
 
   function checkAuth(req: http.IncomingMessage, res: http.ServerResponse): boolean {
-    if (!authToken) return true;
-    const header = req.headers['authorization'] ?? '';
-    if (header === `Bearer ${authToken}`) return true;
-    res.writeHead(401).end(JSON.stringify({ error: 'Unauthorized' }));
+    if (!opts.authToken) return true;
+    if (req.headers['authorization'] === `Bearer ${opts.authToken}`) return true;
+    res
+      .writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' })
+      .end(JSON.stringify({ error: 'Unauthorized' }));
     return false;
   }
 
@@ -76,76 +47,96 @@ export function createEmacsAdapter(): ChannelAdapter & { _server: http.Server | 
     let body = '';
     req.on('data', (chunk) => (body += chunk));
     req.on('end', () => {
+      let text: string;
       try {
-        const { text } = JSON.parse(body) as { text?: string };
-        if (!text?.trim()) {
-          res.writeHead(400).end(JSON.stringify({ error: 'text required' }));
-          return;
-        }
-        const timestamp = new Date().toISOString();
-        const msgId = `emacs-${Date.now()}`;
-        setup?.onInbound(PLATFORM_ID, null, {
-          id: msgId,
-          kind: 'chat',
-          timestamp,
-          content: { text, sender: 'emacs', senderId: PLATFORM_ID },
-        });
+        const parsed = JSON.parse(body) as { text?: string };
+        text = parsed.text ?? '';
+      } catch {
         res
-          .writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
-          .end(JSON.stringify({ messageId: msgId, timestamp: Date.now() }));
-        log.info('Emacs message received', { length: text.length });
-      } catch (err) {
-        log.error('Emacs channel: failed to parse POST body', { err });
-        res.writeHead(400).end(JSON.stringify({ error: 'Invalid JSON' }));
+          .writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' })
+          .end(JSON.stringify({ error: 'Invalid JSON' }));
+        return;
       }
+
+      if (!text.trim()) {
+        res
+          .writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' })
+          .end(JSON.stringify({ error: 'text required' }));
+        return;
+      }
+
+      const timestamp = new Date().toISOString();
+      const id = `emacs-${Date.now()}`;
+
+      const inbound: InboundMessage = {
+        id,
+        kind: 'chat',
+        content: {
+          text,
+          sender: 'Emacs',
+          senderId: `emacs:${opts.platformId}`,
+        },
+        timestamp,
+      };
+
+      try {
+        setupConfig?.onInbound(opts.platformId, null, inbound);
+      } catch (err) {
+        log.error('Emacs onInbound failed', { err });
+      }
+
+      res
+        .writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
+        .end(JSON.stringify({ messageId: id, timestamp: Date.now() }));
     });
   }
 
   function handlePoll(url: URL, res: http.ServerResponse): void {
     const since = parseInt(url.searchParams.get('since') ?? '0', 10);
-    const messages = buffer.filter((m) => m.timestamp > since);
+    const messages = outboundBuffer.filter((m) => m.timestamp > since);
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' }).end(JSON.stringify({ messages }));
   }
 
-  const adapter: ChannelAdapter & { _server: http.Server | null } = {
+  return {
     name: 'emacs',
-    channelType: CHANNEL_TYPE,
+    channelType: 'emacs',
     supportsThreads: false,
-    get _server() {
-      return server;
-    },
 
     async setup(config: ChannelSetup): Promise<void> {
-      setup = config;
-      ensureClaudeMd();
+      setupConfig = config;
+
       server = http.createServer((req, res) => {
         if (!checkAuth(req, res)) return;
-        const url = new URL(req.url ?? '/', `http://localhost:${port}`);
+
+        const url = new URL(req.url ?? '/', `http://localhost:${opts.port}`);
         if (req.method === 'POST' && url.pathname === '/api/message') {
           handlePost(req, res);
         } else if (req.method === 'GET' && url.pathname === '/api/messages') {
           handlePoll(url, res);
         } else {
-          res.writeHead(404).end(JSON.stringify({ error: 'Not found' }));
+          res
+            .writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' })
+            .end(JSON.stringify({ error: 'Not found' }));
         }
       });
+
       await new Promise<void>((resolve, reject) => {
-        server!.listen(port, '127.0.0.1', () => {
-          log.info('Emacs channel listening — load emacs/nanoclaw.el to connect', { port });
+        server!.once('error', reject);
+        server!.listen(opts.port, '127.0.0.1', () => {
+          log.info('Emacs channel listening', { port: opts.port, platformId: opts.platformId });
           resolve();
         });
-        server!.once('error', reject);
       });
+
+      // Stamp a human-readable name on the messaging_groups row on first boot.
+      config.onMetadata(opts.platformId, 'Emacs', false);
     },
 
     async teardown(): Promise<void> {
-      if (server) {
-        await new Promise<void>((resolve) => server!.close(() => resolve()));
-        server = null;
-        log.info('Emacs channel stopped');
-      }
-      setup = null;
-      buffer = [];
+      if (!server) return;
+      await new Promise<void>((resolve) => server!.close(() => resolve()));
+      server = null;
+      log.info('Emacs channel stopped');
     },
 
     isConnected(): boolean {
@@ -153,16 +144,43 @@ export function createEmacsAdapter(): ChannelAdapter & { _server: http.Server | 
     },
 
     async deliver(platformId: string, _threadId: string | null, message: OutboundMessage): Promise<string | undefined> {
-      if (platformId !== PLATFORM_ID) return undefined;
-      const text = extractText(message);
-      if (text === null) return undefined;
-      buffer.push({ text, timestamp: Date.now() });
-      if (buffer.length > 200) buffer.shift();
-      return undefined;
+      if (platformId !== opts.platformId) {
+        log.warn('Emacs deliver called with unknown platformId', { platformId });
+        return undefined;
+      }
+      const text = extractText(message.content);
+      if (!text) return undefined;
+
+      const id = `emacs-out-${Date.now()}`;
+      outboundBuffer.push({ text, timestamp: Date.now() });
+      while (outboundBuffer.length > OUTBOUND_BUFFER_MAX) outboundBuffer.shift();
+      return id;
     },
   };
-
-  return adapter;
 }
 
-registerChannelAdapter('emacs', { factory: createEmacsAdapter });
+function extractText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (content && typeof content === 'object') {
+    const c = content as { text?: unknown };
+    if (typeof c.text === 'string') return c.text;
+  }
+  return '';
+}
+
+registerChannelAdapter('emacs', {
+  factory: () => {
+    const env = readEnvFile(['EMACS_ENABLED', 'EMACS_CHANNEL_PORT', 'EMACS_AUTH_TOKEN', 'EMACS_PLATFORM_ID']);
+    const enabled = process.env.EMACS_ENABLED || env.EMACS_ENABLED;
+    if (!enabled || enabled === 'false') return null;
+
+    const portStr = process.env.EMACS_CHANNEL_PORT || env.EMACS_CHANNEL_PORT || '8766';
+    const port = parseInt(portStr, 10);
+    const authToken = process.env.EMACS_AUTH_TOKEN || env.EMACS_AUTH_TOKEN || null;
+    const platformId = process.env.EMACS_PLATFORM_ID || env.EMACS_PLATFORM_ID || 'default';
+
+    return createEmacsAdapter({ port, authToken, platformId });
+  },
+});
+
+export { createEmacsAdapter };

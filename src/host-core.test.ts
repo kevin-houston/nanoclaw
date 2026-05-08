@@ -884,7 +884,12 @@ describe('agent-to-agent routing', () => {
     const { session: paSlackSession } = resolveSession('ag-pa', 'mg-slack', null, 'shared');
 
     await routeAgentMessage(
-      { id: 'out-a2a-1', platform_id: 'ag-researcher', content: JSON.stringify({ text: 'research this' }), in_reply_to: null },
+      {
+        id: 'out-a2a-1',
+        platform_id: 'ag-researcher',
+        content: JSON.stringify({ text: 'research this' }),
+        in_reply_to: null,
+      },
       paSlackSession,
     );
 
