@@ -489,12 +489,12 @@ function dispatchResultText(text: string, routing: RoutingContext): { sent: numb
         thread_id: destThread,
         content: JSON.stringify({ text: scratchpad }),
       });
-      return;
+      return { sent: 1, hasUnwrapped: false };
     }
     const all = getAllDestinations();
     if (all.length === 1) {
       sendToDestination(all[0], scratchpad, routing);
-      return;
+      return { sent: 1, hasUnwrapped: false };
     }
   }
 

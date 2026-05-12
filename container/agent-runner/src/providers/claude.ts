@@ -284,11 +284,11 @@ export class ClaudeProvider implements AgentProvider {
     const instructions = input.systemContext?.instructions;
 
     // Model: override Claude Code's default to avoid silently picking a 1M
-    // context model (which requires "extra usage" on the account). Accepts an
-    // alias ('sonnet', 'opus', 'haiku') or a full model ID. Override via the
-    // CLAUDE_MODEL env var; add it to CONTAINER_PASSTHROUGH in .env to forward
-    // from the host.
-    const model = process.env.CLAUDE_MODEL || 'sonnet';
+    // context model (which requires "extra usage" on the account). Per-group
+    // container config (`this.model`) wins; CLAUDE_MODEL env is the fallback;
+    // 'sonnet' is the final default. CLAUDE_MODEL must be in CONTAINER_PASSTHROUGH
+    // in .env to forward from the host.
+    const model = this.model || process.env.CLAUDE_MODEL || 'sonnet';
 
     const sdkResult = sdkQuery({
       prompt: stream,
@@ -297,7 +297,6 @@ export class ClaudeProvider implements AgentProvider {
         additionalDirectories: this.additionalDirectories,
         resume: input.continuation,
         pathToClaudeCodeExecutable: '/pnpm/claude',
-        model,
         systemPrompt: instructions ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions } : undefined,
         allowedTools: [
           ...TOOL_ALLOWLIST,
@@ -305,7 +304,7 @@ export class ClaudeProvider implements AgentProvider {
         ],
         disallowedTools: SDK_DISALLOWED_TOOLS,
         env: this.env,
-        model: this.model,
+        model,
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         effort: this.effort as any,
         permissionMode: 'bypassPermissions',
