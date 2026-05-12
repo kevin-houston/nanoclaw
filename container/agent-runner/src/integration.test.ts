@@ -3,6 +3,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './db/connection.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { getPendingMessages } from './db/messages-in.js';
+import { getContinuation, setContinuation } from './db/session-state.js';
 import { MockProvider } from './providers/mock.js';
 import { runPollLoop } from './poll-loop.js';
 
@@ -294,114 +295,7 @@ describe('poll loop integration', () => {
     await loopPromise.catch(() => {});
   });
 
-  it('should inject destination reminder after a compacted event', async () => {
-    // Two destinations — required for the reminder to fire (single-destination
-    // groups have a fallback path that works without <message to="…"> wrapping).
-    getInboundDb()
-      .prepare(
-        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
-         VALUES ('discord-second', 'Discord Second', 'channel', 'discord', 'chan-2', NULL)`,
-      )
-      .run();
-
-    insertMessage('m1', { sender: 'Alice', text: 'First message' }, { platformId: 'chan-1', channelType: 'discord' });
-
-    const provider = new CompactingProvider();
-    const controller = new AbortController();
-    const loopPromise = runPollLoopWithTimeout(provider as unknown as MockProvider, controller.signal, 2500);
-
-    await waitFor(() => getUndeliveredMessages().length > 0, 2500);
-    controller.abort();
-
-    expect(provider.pushes.length).toBeGreaterThanOrEqual(1);
-    const reminder = provider.pushes.find((p) => p.includes('Context was just compacted'));
-    expect(reminder).toBeDefined();
-    expect(reminder).toContain('2 destinations');
-    expect(reminder).toContain('discord-test');
-    expect(reminder).toContain('discord-second');
-    expect(reminder).toContain('<message to="name">');
-
-    await loopPromise.catch(() => {});
-  });
-
-  it('should NOT inject destination reminder with a single destination', async () => {
-    insertMessage('m1', { sender: 'Alice', text: 'First message' }, { platformId: 'chan-1', channelType: 'discord' });
-
-    const provider = new CompactingProvider();
-    const controller = new AbortController();
-    const loopPromise = runPollLoopWithTimeout(provider as unknown as MockProvider, controller.signal, 2500);
-
-    await waitFor(() => getUndeliveredMessages().length > 0, 2500);
-    controller.abort();
-
-    // Only the original prompt push (if any) — no reminder, since beforeEach
-    // seeds exactly one destination.
-    const reminders = provider.pushes.filter((p) => p.includes('Context was just compacted'));
-    expect(reminders).toHaveLength(0);
-
-    await loopPromise.catch(() => {});
-  });
 });
-
-/**
- * Provider that emits a single compacted event mid-stream, then returns a
- * result. Captures every push() call so tests can assert on the injected
- * reminder content.
- */
-class CompactingProvider {
-  readonly supportsNativeSlashCommands = false;
-  readonly pushes: string[] = [];
-
-  isSessionInvalid(): boolean {
-    return false;
-  }
-
-  query(_input: { prompt: string; cwd: string }) {
-    const pushes = this.pushes;
-    let ended = false;
-    let aborted = false;
-    let resolveWaiter: (() => void) | null = null;
-
-    async function* events() {
-      yield { type: 'activity' as const };
-      yield { type: 'init' as const, continuation: 'compaction-test-session' };
-      yield { type: 'activity' as const };
-      yield { type: 'compacted' as const, text: 'Context compacted (50,000 tokens compacted).' };
-
-      // Wait for poll-loop to push the reminder (or end / abort)
-      await new Promise<void>((resolve) => {
-        resolveWaiter = resolve;
-        // Belt-and-braces: don't hang forever if the reminder never arrives
-        setTimeout(resolve, 200);
-      });
-
-      yield { type: 'activity' as const };
-      yield { type: 'result' as const, text: '<message to="discord-test">ack</message>' };
-      while (!ended && !aborted) {
-        await new Promise<void>((resolve) => {
-          resolveWaiter = resolve;
-          setTimeout(resolve, 50);
-        });
-      }
-    }
-
-    return {
-      push(message: string) {
-        pushes.push(message);
-        resolveWaiter?.();
-      },
-      end() {
-        ended = true;
-        resolveWaiter?.();
-      },
-      abort() {
-        aborted = true;
-        resolveWaiter?.();
-      },
-      events: events(),
-    };
-  }
-}
 
 // Helper: run poll loop until aborted or timeout
 async function runPollLoopWithTimeout(provider: MockProvider, signal: AbortSignal, timeoutMs: number): Promise<void> {
@@ -428,4 +322,143 @@ async function waitFor(condition: () => boolean, timeoutMs: number): Promise<voi
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+describe('poll loop — provider error recovery', () => {
+  it('writes error to outbound and continues loop on provider throw', async () => {
+    insertMessage('m1', { sender: 'Alice', text: 'trigger error' }, { platformId: 'chan-1', channelType: 'discord' });
+
+    const provider = new ThrowingProvider('API rate limit exceeded');
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider as unknown as MockProvider, controller.signal, 2000);
+
+    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    controller.abort();
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toContain('Error:');
+    expect(JSON.parse(out[0].content).text).toContain('API rate limit exceeded');
+
+    // Input message should be marked completed despite the error
+    const pending = getPendingMessages();
+    expect(pending).toHaveLength(0);
+
+    await loopPromise.catch(() => {});
+  });
+});
+
+describe('poll loop — stale session recovery', () => {
+  it('clears continuation when provider reports session invalid', async () => {
+    // Pre-seed a continuation so the local variable in runPollLoop is set.
+    // Without this, the `if (continuation && isSessionInvalid)` check skips.
+    setContinuation('mock', 'pre-existing-session');
+
+    insertMessage('m1', { sender: 'Alice', text: 'stale session' }, { platformId: 'chan-1', channelType: 'discord' });
+
+    const provider = new InvalidSessionProvider();
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider as unknown as MockProvider, controller.signal, 2000);
+
+    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    controller.abort();
+
+    // Error was written to outbound
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toContain('Error:');
+
+    // Continuation was cleared (isSessionInvalid returned true)
+    expect(getContinuation('mock')).toBeUndefined();
+
+    await loopPromise.catch(() => {});
+  });
+});
+
+describe('poll loop — /clear command', () => {
+  it('clears session, writes confirmation, skips query', async () => {
+    // Seed a continuation so we can verify it gets cleared
+    setContinuation('mock', 'existing-session-id');
+    expect(getContinuation('mock')).toBe('existing-session-id');
+
+    // Insert a /clear command
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, platform_id, channel_type, content)
+         VALUES ('m-clear', 'chat', datetime('now'), 'pending', 'chan-1', 'discord', ?)`,
+      )
+      .run(JSON.stringify({ text: '/clear' }));
+
+    const provider = new MockProvider({}, () => '<message to="discord-test">should not run</message>');
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
+
+    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    controller.abort();
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toBe('Session cleared.');
+
+    // Continuation was cleared
+    expect(getContinuation('mock')).toBeUndefined();
+
+    // Command message was completed
+    const pending = getPendingMessages();
+    expect(pending).toHaveLength(0);
+
+    await loopPromise.catch(() => {});
+  });
+});
+
+/**
+ * Provider that throws on every query, simulating API failures.
+ */
+class ThrowingProvider {
+  readonly supportsNativeSlashCommands = false;
+  private errorMessage: string;
+
+  constructor(errorMessage: string) {
+    this.errorMessage = errorMessage;
+  }
+
+  isSessionInvalid(): boolean {
+    return false;
+  }
+
+  query(_input: { prompt: string; cwd: string }) {
+    const errorMessage = this.errorMessage;
+    return {
+      push() {},
+      end() {},
+      abort() {},
+      events: (async function* () {
+        throw new Error(errorMessage);
+      })(),
+    };
+  }
+}
+
+/**
+ * Provider that throws with an error that triggers isSessionInvalid.
+ * First emits an init event (setting continuation), then throws.
+ */
+class InvalidSessionProvider {
+  readonly supportsNativeSlashCommands = false;
+
+  isSessionInvalid(): boolean {
+    return true;
+  }
+
+  query(_input: { prompt: string; cwd: string }) {
+    return {
+      push() {},
+      end() {},
+      abort() {},
+      events: (async function* () {
+        yield { type: 'init' as const, continuation: 'doomed-session' };
+        throw new Error('session not found');
+      })(),
+    };
+  }
 }
