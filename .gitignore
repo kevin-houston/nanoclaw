@@ -39,3 +39,6 @@ groups/*
 .nanoclaw/
 
 agents-sdk-docs
+
+# Per-installation scheduled-task lock (transient runtime state)
+.claude/scheduled_tasks.lock
