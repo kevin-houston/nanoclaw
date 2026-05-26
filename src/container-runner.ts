@@ -523,10 +523,7 @@ async function buildContainerArgs(
   // — `claude setup-token` tokens lack that scope and fail Claude Code CLI's startup
   // validation. The companion script scripts/rotate-claude-token.sh keeps .env in
   // sync with ~/.claude/.credentials.json.
-  const { CLAUDE_CODE_OAUTH_TOKEN, GITHUB_TOKEN } = readEnvFile([
-    'CLAUDE_CODE_OAUTH_TOKEN',
-    'GITHUB_TOKEN',
-  ]);
+  const { CLAUDE_CODE_OAUTH_TOKEN, GITHUB_TOKEN } = readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'GITHUB_TOKEN']);
 
   // Forward Ollama admin tools flag if enabled
   if (OLLAMA_ADMIN_TOOLS) {
