@@ -42,3 +42,7 @@ agents-sdk-docs
 
 # Per-installation scheduled-task lock (transient runtime state)
 .claude/scheduled_tasks.lock
+
+# here-now publish state: contains claim tokens (one-shot ownership transfer
+# secrets returned only once). Per the here-now skill: never commit.
+.herenow/
