@@ -52,7 +52,12 @@ export async function handleInstallPackages(content: Record<string, unknown>, se
     return;
   }
 
-  const packageList = [...apt.map((p) => `apt: ${p}`), ...npm.map((p) => `npm: ${p}`)].join(', ');
+  // Wrap package names in backticks. They contain `_`, `+`, `.` etc. which the
+  // Telegram chat-sdk treats as Markdown entity markers when rendering Cards
+  // — an unbalanced `_` makes Telegram reject the whole approval card with
+  // "can't parse entities". Backticks render as inline code on every platform
+  // and the parser treats their contents literally.
+  const packageList = [...apt.map((p) => `apt: \`${p}\``), ...npm.map((p) => `npm: \`${p}\``)].join(', ');
   await requestApproval({
     session,
     agentName: agentGroup.name,
@@ -86,6 +91,6 @@ export async function handleAddMcpServer(content: Record<string, unknown>, sessi
       env: (content.env as Record<string, string>) || {},
     },
     title: 'Add MCP Request',
-    question: `Agent "${agentGroup.name}" is attempting to add a new MCP server:\n${serverName} (${command})`,
+    question: `Agent "${agentGroup.name}" is attempting to add a new MCP server:\n\`${serverName}\` (\`${command}\`)`,
   });
 }

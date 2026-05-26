@@ -35,6 +35,13 @@ export interface ContainerConfig {
   packages: { apt: string[]; npm: string[] };
   imageTag?: string;
   additionalMounts: AdditionalMountConfig[];
+  /**
+   * Privileged mounts — bypass mount-security (no /workspace/extra/ prefix,
+   * no allowlist check). Use only for paths that must land at a specific
+   * absolute location inside the container (e.g. /var/run/docker.sock).
+   * Each entry grants the container the same access the host has at that path.
+   */
+  privilegedMounts?: AdditionalMountConfig[];
   skills: string[] | 'all';
   provider?: string;
   groupName?: string;
@@ -55,6 +62,7 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
     },
     imageTag: row.image_tag ?? undefined,
     additionalMounts: JSON.parse(row.additional_mounts) as AdditionalMountConfig[],
+    privilegedMounts: JSON.parse(row.privileged_mounts) as AdditionalMountConfig[],
     skills: JSON.parse(row.skills) as string[] | 'all',
     provider: row.provider ?? undefined,
     groupName: group.name,

@@ -16,11 +16,11 @@ import {
   CONTAINER_INSTALL_LABEL,
   DATA_DIR,
   GROUPS_DIR,
+  OLLAMA_ADMIN_TOOLS,
   ONECLI_API_KEY,
   ONECLI_URL,
   TIMEZONE,
 } from './config.js';
-import { readEnvFile } from './env.js';
 import { materializeContainerJson } from './container-config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { updateContainerConfigScalars, updateContainerConfigJson } from './db/container-configs.js';
@@ -31,6 +31,7 @@ import { getDb, hasTable } from './db/connection.js';
 import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
+import { readEnvFile } from './env.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
 // Provider host-side config barrel — each provider that needs host-side
 // container setup self-registers on import.
@@ -156,7 +157,13 @@ async function spawnContainer(session: Session): Promise<void> {
   // immediate kill before the new container touches the file itself.
   fs.rmSync(heartbeatPath(agentGroup.id, session.id), { force: true });
 
-  const container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  // Move every `-e KEY=value` flag into a 0o600 env-file in the session dir,
+  // so credentials (Anthropic OAuth, GitHub PAT, OneCLI bearer, passthrough keys)
+  // never appear on the docker command line — and therefore not in `ps`, in
+  // `systemctl status` CGroup dumps, or in the journal.
+  const { args: spawnArgs, cleanup: cleanupEnvFile } = moveEnvToFile(args, sessionDir(agentGroup.id, session.id));
+
+  const container = spawn(CONTAINER_RUNTIME_BIN, spawnArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
 
   activeContainers.set(session.id, { process: container, containerName });
   markContainerRunning(session.id);
@@ -180,6 +187,7 @@ async function spawnContainer(session: Session): Promise<void> {
     activeContainers.delete(session.id);
     markContainerStopped(session.id);
     stopTypingRefresh(session.id);
+    cleanupEnvFile();
     log.info('Container exited', { sessionId: session.id, code, containerName });
   });
 
@@ -187,6 +195,7 @@ async function spawnContainer(session: Session): Promise<void> {
     activeContainers.delete(session.id);
     markContainerStopped(session.id);
     stopTypingRefresh(session.id);
+    cleanupEnvFile();
     log.error('Container spawn error', { sessionId: session.id, err });
   });
 }
@@ -328,6 +337,25 @@ function buildMounts(
     mounts.push(...validated);
   }
 
+  // Privileged mounts — explicitly bypass mount-security so they land at
+  // their specified absolute container paths (e.g. /var/run/docker.sock).
+  // No allowlist check, no /workspace/extra/ prefix. Documented in
+  // container-config.ts; the user opts in by editing container.json directly.
+  if (containerConfig.privilegedMounts && containerConfig.privilegedMounts.length > 0) {
+    for (const m of containerConfig.privilegedMounts) {
+      mounts.push({
+        hostPath: m.hostPath,
+        containerPath: m.containerPath,
+        readonly: m.readonly ?? false,
+      });
+    }
+    log.warn('Privileged mounts active (mount-security bypassed)', {
+      group: agentGroup.name,
+      count: containerConfig.privilegedMounts.length,
+      paths: containerConfig.privilegedMounts.map((m) => `${m.hostPath} → ${m.containerPath}`),
+    });
+  }
+
   // Provider-contributed mounts (e.g. opencode-xdg)
   if (providerContribution.mounts) {
     mounts.push(...providerContribution.mounts);
@@ -398,6 +426,82 @@ function syncSkillSymlinks(claudeDir: string, containerConfig: import('./contain
   }
 }
 
+/**
+ * Rewrite a docker-run argv to move every `-e KEY=value` pair into a
+ * `--env-file <path>`. Returns the rewritten argv and a cleanup callback
+ * that deletes the temp file (idempotent — safe to call from both `close`
+ * and `error` handlers).
+ *
+ * Why: `-e KEY=value` flags surface in `ps`, in `systemctl status` CGroup
+ * dumps, and in journald. Credentials passed inline (Anthropic OAuth token,
+ * GitHub PAT, OneCLI bearer in HTTPS_PROXY, and the per-group passthrough
+ * keys) leak through any of those channels. `--env-file` is read by docker
+ * once at container start and the values never appear on the command line.
+ *
+ * Sweeps both NanoClaw's own `-e` pushes and OneCLI's (mutated via
+ * `applyContainerConfig`). Bare `-e KEY` host-passthrough flags (no `=`)
+ * are kept inline — docker semantics for those aren't representable in
+ * `--env-file`, and NanoClaw doesn't emit any today.
+ *
+ * The temp file goes into the session dir alongside inbound.db / outbound.db
+ * with mode 0o600. Created synchronously so spawn cannot race the write.
+ */
+export function moveEnvToFile(args: string[], sessDir: string): { args: string[]; cleanup: () => void } {
+  const kept: string[] = [];
+  const envLines: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '-e' && i + 1 < args.length) {
+      const kv = args[i + 1];
+      if (!kv.includes('=')) {
+        // `-e KEY` (no value) means "passthrough host env" — can't represent in env-file.
+        log.warn('Bare -e env-passthrough flag kept inline (env-file cannot represent it)', { kv });
+        kept.push('-e', kv);
+      } else if (kv.includes('\n')) {
+        // docker env-file uses newline-delimited records; an embedded newline would corrupt the file.
+        // Refusing is safer than silently truncating a credential.
+        const key = kv.slice(0, kv.indexOf('='));
+        throw new Error(`env value contains newline (key=${key}); refusing to write to env-file`);
+      } else {
+        envLines.push(kv);
+      }
+      i++; // skip value
+      continue;
+    }
+    kept.push(args[i]);
+  }
+  if (envLines.length === 0) {
+    return { args: kept, cleanup: () => {} };
+  }
+  const envFile = path.join(sessDir, '.env.container');
+  fs.writeFileSync(envFile, envLines.join('\n') + '\n', { mode: 0o600 });
+  // Tighten in case umask or pre-existing inode loosened the mode.
+  try {
+    fs.chmodSync(envFile, 0o600);
+  } catch {
+    // best-effort; the writeFileSync mode should have taken effect
+  }
+  // --env-file accepts any position before the image tag; insert right after the
+  // 6-element `run --rm --name <n> --label <l>` prefix that buildContainerArgs
+  // guarantees. Index 6 is *after* the LABEL value at index 5, not before it —
+  // splice(5, …) would split `--label` from its argument and corrupt the argv.
+  kept.splice(6, 0, '--env-file', envFile);
+
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    try {
+      fs.unlinkSync(envFile);
+    } catch (err) {
+      // ENOENT is fine (already cleaned); log others.
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        log.warn('Failed to clean up env-file', { envFile, err: String(err) });
+      }
+    }
+  };
+  return { args: kept, cleanup };
+}
+
 async function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
@@ -413,6 +517,19 @@ async function buildContainerArgs(
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
   args.push('-e', `TZ=${TIMEZONE}`);
 
+  // Claude OAuth + GitHub token from .env so they never touch process.env.
+  // OAuth required because the OneCLI vault's x-api-key injection isn't a usable
+  // Claude API key. Token must come from a /login session (has user:profile scope)
+  // — `claude setup-token` tokens lack that scope and fail Claude Code CLI's startup
+  // validation. The companion script scripts/rotate-claude-token.sh keeps .env in
+  // sync with ~/.claude/.credentials.json.
+  const { CLAUDE_CODE_OAUTH_TOKEN, GITHUB_TOKEN } = readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'GITHUB_TOKEN']);
+
+  // Forward Ollama admin tools flag if enabled
+  if (OLLAMA_ADMIN_TOOLS) {
+    args.push('-e', 'OLLAMA_ADMIN_TOOLS=true');
+  }
+
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   if (providerContribution.env) {
     for (const [key, value] of Object.entries(providerContribution.env)) {
@@ -420,8 +537,8 @@ async function buildContainerArgs(
     }
   }
 
-  // Forward additional env vars listed in CONTAINER_ENV_PASSTHROUGH from .env.
-  // Use this for non-secret config that OneCLI vault doesn't manage (e.g. URLs).
+  // CONTAINER_ENV_PASSTHROUGH (parsed array from config.ts) forwards listed .env vars
+  // to every container. Use for non-secret config OneCLI vault doesn't manage (e.g. URLs).
   // For real secrets, prefer the OneCLI vault.
   if (CONTAINER_ENV_PASSTHROUGH.length > 0) {
     const passthroughValues = readEnvFile(CONTAINER_ENV_PASSTHROUGH);
@@ -444,20 +561,23 @@ async function buildContainerArgs(
   if (!onecliApplied) {
     throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
   }
+  log.info('OneCLI gateway applied', { containerName });
 
-  // Claude OAuth token — injected after OneCLI so it overrides ANTHROPIC_API_KEY=placeholder.
-  // Docker uses the last value for duplicate env var names, so this wins. Clearing
-  // ANTHROPIC_API_KEY lets Claude Code fall through to CLAUDE_CODE_OAUTH_TOKEN.
-  // Required because the OneCLI vault's x-api-key injection isn't a usable Claude API key.
-  // Token must come from a /login session (has user:profile scope) — `claude setup-token`
-  // tokens lack that scope and fail Claude Code CLI's startup validation. The companion
-  // script scripts/rotate-claude-token.sh keeps .env in sync with ~/.claude/.credentials.json.
-  const { CLAUDE_CODE_OAUTH_TOKEN } = readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN']);
+  // Claude OAuth token — added AFTER OneCLI so it overrides the ANTHROPIC_API_KEY=placeholder
+  // OneCLI injects. Docker uses the last value for duplicate env var names, so this wins.
+  // Clearing ANTHROPIC_API_KEY lets Claude Code fall through to CLAUDE_CODE_OAUTH_TOKEN.
   if (CLAUDE_CODE_OAUTH_TOKEN) {
     args.push('-e', 'ANTHROPIC_API_KEY=');
     args.push('-e', `CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}`);
   }
-  log.info('OneCLI gateway applied', { containerName });
+
+  // GitHub token — injected as both GH_TOKEN (gh CLI) and GITHUB_TOKEN (git tooling, Actions).
+  // The OneCLI proxy injects this as a Bearer header for API calls, but git HTTPS auth requires
+  // Basic auth; having the raw token as an env var lets the agent configure git credentials directly.
+  if (GITHUB_TOKEN) {
+    args.push('-e', `GITHUB_TOKEN=${GITHUB_TOKEN}`);
+    args.push('-e', `GH_TOKEN=${GITHUB_TOKEN}`);
+  }
 
   // Host gateway
   args.push(...hostGatewayArgs());
@@ -468,6 +588,25 @@ async function buildContainerArgs(
   if (hostUid != null && hostUid !== 0 && hostUid !== 1000) {
     args.push('--user', `${hostUid}:${hostGid}`);
     args.push('-e', 'HOME=/home/node');
+  }
+
+  // Auto-derive supplementary groups from privileged mounts. Each privileged
+  // mount file may be owned by a host group (e.g. /var/run/docker.sock is
+  // owned by gid=docker). Add that gid as --group-add so the container
+  // process can read/write the socket without changing user.
+  if (containerConfig.privilegedMounts && containerConfig.privilegedMounts.length > 0) {
+    const gids = new Set<number>();
+    for (const m of containerConfig.privilegedMounts) {
+      try {
+        const stat = fs.statSync(m.hostPath);
+        if (stat.gid !== 0) gids.add(stat.gid);
+      } catch (err) {
+        log.warn('Could not stat privileged mount for gid', { hostPath: m.hostPath, err });
+      }
+    }
+    for (const gid of gids) {
+      args.push('--group-add', String(gid));
+    }
   }
 
   // Volume mounts

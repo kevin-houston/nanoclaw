@@ -27,6 +27,7 @@ function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
     packages_apt: JSON.parse(row.packages_apt),
     packages_npm: JSON.parse(row.packages_npm),
     additional_mounts: JSON.parse(row.additional_mounts),
+    privileged_mounts: JSON.parse(row.privileged_mounts),
     cli_scope: row.cli_scope,
     updated_at: row.updated_at,
   };

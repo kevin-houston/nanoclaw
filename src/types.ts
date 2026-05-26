@@ -24,6 +24,7 @@ export interface ContainerConfigRow {
   packages_apt: string; // JSON: string[]
   packages_npm: string; // JSON: string[]
   additional_mounts: string; // JSON: AdditionalMountConfig[]
+  privileged_mounts: string; // JSON: AdditionalMountConfig[] — bypasses mount-security
   cli_scope: string; // 'disabled' | 'group' | 'global'
   updated_at: string;
 }

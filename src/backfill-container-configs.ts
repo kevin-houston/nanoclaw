@@ -20,6 +20,7 @@ interface LegacyContainerJson {
   packages?: { apt?: string[]; npm?: string[] };
   imageTag?: string;
   additionalMounts?: AdditionalMountConfig[];
+  privilegedMounts?: AdditionalMountConfig[];
   skills?: string[] | 'all';
   provider?: string;
   assistantName?: string;
@@ -64,6 +65,7 @@ export function backfillContainerConfigs(): void {
       packages_apt: JSON.stringify(legacy.packages?.apt ?? []),
       packages_npm: JSON.stringify(legacy.packages?.npm ?? []),
       additional_mounts: JSON.stringify(legacy.additionalMounts ?? []),
+      privileged_mounts: JSON.stringify(legacy.privilegedMounts ?? []),
       cli_scope: 'group',
       updated_at: new Date().toISOString(),
     };
