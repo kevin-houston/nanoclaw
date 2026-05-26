@@ -156,7 +156,13 @@ async function spawnContainer(session: Session): Promise<void> {
   // immediate kill before the new container touches the file itself.
   fs.rmSync(heartbeatPath(agentGroup.id, session.id), { force: true });
 
-  const container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  // Move every `-e KEY=value` flag into a 0o600 env-file in the session dir,
+  // so credentials (Anthropic OAuth, GitHub PAT, OneCLI bearer, passthrough keys)
+  // never appear on the docker command line — and therefore not in `ps`, in
+  // `systemctl status` CGroup dumps, or in the journal.
+  const { args: spawnArgs, cleanup: cleanupEnvFile } = moveEnvToFile(args, sessionDir(agentGroup.id, session.id));
+
+  const container = spawn(CONTAINER_RUNTIME_BIN, spawnArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
 
   activeContainers.set(session.id, { process: container, containerName });
   markContainerRunning(session.id);
@@ -180,6 +186,7 @@ async function spawnContainer(session: Session): Promise<void> {
     activeContainers.delete(session.id);
     markContainerStopped(session.id);
     stopTypingRefresh(session.id);
+    cleanupEnvFile();
     log.info('Container exited', { sessionId: session.id, code, containerName });
   });
 
@@ -187,6 +194,7 @@ async function spawnContainer(session: Session): Promise<void> {
     activeContainers.delete(session.id);
     markContainerStopped(session.id);
     stopTypingRefresh(session.id);
+    cleanupEnvFile();
     log.error('Container spawn error', { sessionId: session.id, err });
   });
 }
@@ -415,6 +423,82 @@ function syncSkillSymlinks(claudeDir: string, containerConfig: import('./contain
       fs.symlinkSync(`/app/skills/${skill}`, linkPath);
     }
   }
+}
+
+/**
+ * Rewrite a docker-run argv to move every `-e KEY=value` pair into a
+ * `--env-file <path>`. Returns the rewritten argv and a cleanup callback
+ * that deletes the temp file (idempotent — safe to call from both `close`
+ * and `error` handlers).
+ *
+ * Why: `-e KEY=value` flags surface in `ps`, in `systemctl status` CGroup
+ * dumps, and in journald. Credentials passed inline (Anthropic OAuth token,
+ * GitHub PAT, OneCLI bearer in HTTPS_PROXY, and the per-group passthrough
+ * keys) leak through any of those channels. `--env-file` is read by docker
+ * once at container start and the values never appear on the command line.
+ *
+ * Sweeps both NanoClaw's own `-e` pushes and OneCLI's (mutated via
+ * `applyContainerConfig`). Bare `-e KEY` host-passthrough flags (no `=`)
+ * are kept inline — docker semantics for those aren't representable in
+ * `--env-file`, and NanoClaw doesn't emit any today.
+ *
+ * The temp file goes into the session dir alongside inbound.db / outbound.db
+ * with mode 0o600. Created synchronously so spawn cannot race the write.
+ */
+export function moveEnvToFile(args: string[], sessDir: string): { args: string[]; cleanup: () => void } {
+  const kept: string[] = [];
+  const envLines: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '-e' && i + 1 < args.length) {
+      const kv = args[i + 1];
+      if (!kv.includes('=')) {
+        // `-e KEY` (no value) means "passthrough host env" — can't represent in env-file.
+        log.warn('Bare -e env-passthrough flag kept inline (env-file cannot represent it)', { kv });
+        kept.push('-e', kv);
+      } else if (kv.includes('\n')) {
+        // docker env-file uses newline-delimited records; an embedded newline would corrupt the file.
+        // Refusing is safer than silently truncating a credential.
+        const key = kv.slice(0, kv.indexOf('='));
+        throw new Error(`env value contains newline (key=${key}); refusing to write to env-file`);
+      } else {
+        envLines.push(kv);
+      }
+      i++; // skip value
+      continue;
+    }
+    kept.push(args[i]);
+  }
+  if (envLines.length === 0) {
+    return { args: kept, cleanup: () => {} };
+  }
+  const envFile = path.join(sessDir, '.env.container');
+  fs.writeFileSync(envFile, envLines.join('\n') + '\n', { mode: 0o600 });
+  // Tighten in case umask or pre-existing inode loosened the mode.
+  try {
+    fs.chmodSync(envFile, 0o600);
+  } catch {
+    // best-effort; the writeFileSync mode should have taken effect
+  }
+  // --env-file accepts any position before the image tag; insert right after the
+  // 6-element `run --rm --name <n> --label <l>` prefix that buildContainerArgs
+  // guarantees. Index 6 is *after* the LABEL value at index 5, not before it —
+  // splice(5, …) would split `--label` from its argument and corrupt the argv.
+  kept.splice(6, 0, '--env-file', envFile);
+
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    try {
+      fs.unlinkSync(envFile);
+    } catch (err) {
+      // ENOENT is fine (already cleaned); log others.
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        log.warn('Failed to clean up env-file', { envFile, err: String(err) });
+      }
+    }
+  };
+  return { args: kept, cleanup };
 }
 
 async function buildContainerArgs(
