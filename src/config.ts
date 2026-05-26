@@ -13,6 +13,7 @@ const envConfig = readEnvFile([
   'ONECLI_URL',
   'ONECLI_API_KEY',
   'TZ',
+  'CONTAINER_ENV_PASSTHROUGH',
 ]);
 
 export const ASSISTANT_NAME = process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
@@ -74,3 +75,11 @@ function resolveConfigTimezone(): string {
   return 'UTC';
 }
 export const TIMEZONE = resolveConfigTimezone();
+
+// Comma-separated list of env var names to forward from .env into containers.
+// Example: CONTAINER_ENV_PASSTHROUGH=OPENAI_API_KEY,FMP_API_KEY
+const passthroughRaw = process.env.CONTAINER_ENV_PASSTHROUGH || envConfig.CONTAINER_ENV_PASSTHROUGH || '';
+export const CONTAINER_ENV_PASSTHROUGH: string[] = passthroughRaw
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);

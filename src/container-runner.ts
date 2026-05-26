@@ -10,6 +10,7 @@ import path from 'path';
 import { OneCLI } from '@onecli-sh/sdk';
 
 import {
+  CONTAINER_ENV_PASSTHROUGH,
   CONTAINER_IMAGE,
   CONTAINER_IMAGE_BASE,
   CONTAINER_INSTALL_LABEL,
@@ -516,12 +517,15 @@ async function buildContainerArgs(
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
   args.push('-e', `TZ=${TIMEZONE}`);
 
-  // Claude OAuth token — read from .env so it never touches process.env.
-  // Claude Code picks this up automatically when present.
-  const { CLAUDE_CODE_OAUTH_TOKEN, GITHUB_TOKEN, CONTAINER_PASSTHROUGH } = readEnvFile([
+  // Claude OAuth + GitHub token from .env so they never touch process.env.
+  // OAuth required because the OneCLI vault's x-api-key injection isn't a usable
+  // Claude API key. Token must come from a /login session (has user:profile scope)
+  // — `claude setup-token` tokens lack that scope and fail Claude Code CLI's startup
+  // validation. The companion script scripts/rotate-claude-token.sh keeps .env in
+  // sync with ~/.claude/.credentials.json.
+  const { CLAUDE_CODE_OAUTH_TOKEN, GITHUB_TOKEN } = readEnvFile([
     'CLAUDE_CODE_OAUTH_TOKEN',
     'GITHUB_TOKEN',
-    'CONTAINER_PASSTHROUGH',
   ]);
 
   // Forward Ollama admin tools flag if enabled
@@ -533,6 +537,18 @@ async function buildContainerArgs(
   if (providerContribution.env) {
     for (const [key, value] of Object.entries(providerContribution.env)) {
       args.push('-e', `${key}=${value}`);
+    }
+  }
+
+  // CONTAINER_ENV_PASSTHROUGH (parsed array from config.ts) forwards listed .env vars
+  // to every container. Use for non-secret config OneCLI vault doesn't manage (e.g. URLs).
+  // For real secrets, prefer the OneCLI vault.
+  if (CONTAINER_ENV_PASSTHROUGH.length > 0) {
+    const passthroughValues = readEnvFile(CONTAINER_ENV_PASSTHROUGH);
+    for (const key of CONTAINER_ENV_PASSTHROUGH) {
+      if (passthroughValues[key]) {
+        args.push('-e', `${key}=${passthroughValues[key]}`);
+      }
     }
   }
 
@@ -550,8 +566,8 @@ async function buildContainerArgs(
   }
   log.info('OneCLI gateway applied', { containerName });
 
-  // Claude OAuth token — added after OneCLI so it overrides the ANTHROPIC_API_KEY=placeholder
-  // that OneCLI injects. Docker uses the last value for duplicate env var names, so this wins.
+  // Claude OAuth token — added AFTER OneCLI so it overrides the ANTHROPIC_API_KEY=placeholder
+  // OneCLI injects. Docker uses the last value for duplicate env var names, so this wins.
   // Clearing ANTHROPIC_API_KEY lets Claude Code fall through to CLAUDE_CODE_OAUTH_TOKEN.
   if (CLAUDE_CODE_OAUTH_TOKEN) {
     args.push('-e', 'ANTHROPIC_API_KEY=');
@@ -564,20 +580,6 @@ async function buildContainerArgs(
   if (GITHUB_TOKEN) {
     args.push('-e', `GITHUB_TOKEN=${GITHUB_TOKEN}`);
     args.push('-e', `GH_TOKEN=${GITHUB_TOKEN}`);
-  }
-
-  // Generic passthrough: CONTAINER_PASSTHROUGH=VAR1,VAR2 in .env forwards those vars to every container.
-  // Add new API keys here without touching this code — just update .env.
-  if (CONTAINER_PASSTHROUGH) {
-    const passthroughKeys = CONTAINER_PASSTHROUGH.split(',')
-      .map((k) => k.trim())
-      .filter(Boolean);
-    const passthroughVals = readEnvFile(passthroughKeys);
-    for (const key of passthroughKeys) {
-      if (passthroughVals[key]) {
-        args.push('-e', `${key}=${passthroughVals[key]}`);
-      }
-    }
   }
 
   // Host gateway
