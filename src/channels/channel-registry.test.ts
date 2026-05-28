@@ -72,10 +72,14 @@ describe('channel registry', () => {
   beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
+    const { __resetChannelRegistryForTests } = await import('./channel-registry.js');
+    __resetChannelRegistryForTests();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    const { __resetChannelRegistryForTests } = await import('./channel-registry.js');
+    __resetChannelRegistryForTests();
   });
 
   it('should register and retrieve channel adapters', async () => {
@@ -115,12 +119,153 @@ describe('channel registry', () => {
     const noCreds = active.find((a) => a.name === 'no-creds');
     expect(noCreds).toBeUndefined();
   });
+
+  it('should retry adapter setup in the background after inline retries exhaust', async () => {
+    vi.useFakeTimers();
+    try {
+      const { registerChannelAdapter, initChannelAdapters, getChannelAdapter, teardownChannelAdapters } =
+        await import('./channel-registry.js');
+
+      const netErr = () => {
+        const e = new Error('Network error calling fake API');
+        e.name = 'NetworkError';
+        return e;
+      };
+      const adapter = createMockAdapter('flaky');
+      // Fail 5 times (3 inline + 2 background) then succeed.
+      const originalSetup = adapter.setup.bind(adapter);
+      let calls = 0;
+      adapter.setup = async (config: ChannelSetup) => {
+        calls += 1;
+        if (calls <= 5) throw netErr();
+        await originalSetup(config);
+      };
+
+      registerChannelAdapter('flaky', { factory: () => adapter });
+
+      // initChannelAdapters should return promptly even though setup is still
+      // failing — it falls through to a background retry rather than hanging.
+      const initPromise = initChannelAdapters(() => ({
+        conversations: [],
+        onInbound: () => {},
+        onInboundEvent: () => {},
+        onMetadata: () => {},
+        onAction: () => {},
+      }));
+      // Drain the three inline retries (2s + 5s + 10s).
+      await vi.advanceTimersByTimeAsync(20_000);
+      await initPromise;
+      expect(getChannelAdapter('flaky')).toBeUndefined();
+
+      // First background retry at +30s — still failing.
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(getChannelAdapter('flaky')).toBeUndefined();
+      // Second background retry at +60s — succeeds (call #6).
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(getChannelAdapter('flaky')).toBeDefined();
+      expect(calls).toBe(6);
+
+      await teardownChannelAdapters();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('should give up background retries on non-network errors', async () => {
+    vi.useFakeTimers();
+    try {
+      const { registerChannelAdapter, initChannelAdapters, getChannelAdapter, teardownChannelAdapters } =
+        await import('./channel-registry.js');
+
+      const netErr = () => {
+        const e = new Error('flap');
+        e.name = 'NetworkError';
+        return e;
+      };
+      const adapter = createMockAdapter('misconfig');
+      let calls = 0;
+      adapter.setup = async () => {
+        calls += 1;
+        // Inline retries: NetworkError so they retry. First background attempt:
+        // a different error — must NOT retry further.
+        if (calls <= 4) throw netErr();
+        throw new Error('bad token');
+      };
+
+      registerChannelAdapter('misconfig', { factory: () => adapter });
+
+      const initPromise = initChannelAdapters(() => ({
+        conversations: [],
+        onInbound: () => {},
+        onInboundEvent: () => {},
+        onMetadata: () => {},
+        onAction: () => {},
+      }));
+      await vi.advanceTimersByTimeAsync(20_000);
+      await initPromise;
+      // First background attempt at +30s throws a non-NetworkError — should stop.
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(calls).toBe(5);
+      // Far into the future — no more attempts scheduled.
+      await vi.advanceTimersByTimeAsync(600_000);
+      expect(calls).toBe(5);
+      expect(getChannelAdapter('misconfig')).toBeUndefined();
+
+      await teardownChannelAdapters();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('teardown cancels pending background retries', async () => {
+    vi.useFakeTimers();
+    try {
+      const { registerChannelAdapter, initChannelAdapters, teardownChannelAdapters } =
+        await import('./channel-registry.js');
+
+      const netErr = () => {
+        const e = new Error('down');
+        e.name = 'NetworkError';
+        return e;
+      };
+      const adapter = createMockAdapter('always-down');
+      let calls = 0;
+      adapter.setup = async () => {
+        calls += 1;
+        throw netErr();
+      };
+
+      registerChannelAdapter('always-down', { factory: () => adapter });
+
+      const initPromise = initChannelAdapters(() => ({
+        conversations: [],
+        onInbound: () => {},
+        onInboundEvent: () => {},
+        onMetadata: () => {},
+        onAction: () => {},
+      }));
+      await vi.advanceTimersByTimeAsync(20_000);
+      await initPromise;
+      const callsAfterInit = calls;
+      expect(callsAfterInit).toBe(4); // 1 initial + 3 inline retries
+
+      await teardownChannelAdapters();
+      // No further retries should fire.
+      await vi.advanceTimersByTimeAsync(600_000);
+      expect(calls).toBe(callsAfterInit);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe('channel + router integration', () => {
   beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
+
+    const { __resetChannelRegistryForTests } = await import('./channel-registry.js');
+    __resetChannelRegistryForTests();
 
     const { initTestDb, runMigrations, createAgentGroup, createMessagingGroup, createMessagingGroupAgent } =
       await import('../db/index.js');
