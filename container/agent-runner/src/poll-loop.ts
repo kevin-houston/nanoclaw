@@ -14,6 +14,7 @@ import {
   type RoutingContext,
 } from './formatter.js';
 import { getSessionRouting } from './db/session-routing.js';
+import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
 
 const POLL_INTERVAL_MS = 1000;
@@ -158,6 +159,19 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           channel_type: routing.channelType,
           thread_id: routing.threadId,
           content: JSON.stringify({ text: 'Session cleared.' }),
+        });
+        commandIds.push(msg.id);
+        continue;
+      }
+      if ((msg.kind === 'chat' || msg.kind === 'chat-sdk') && isUploadTraceCommand(msg)) {
+        log('Uploading session trace to Hugging Face');
+        writeMessageOut({
+          id: generateId(),
+          kind: 'chat',
+          platform_id: routing.platformId,
+          channel_type: routing.channelType,
+          thread_id: routing.threadId,
+          content: JSON.stringify({ text: uploadTrace() }),
         });
         commandIds.push(msg.id);
         continue;
