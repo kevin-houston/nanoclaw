@@ -42,3 +42,11 @@ agents-sdk-docs
 
 # Per-installation scheduled-task lock (transient runtime state)
 .claude/scheduled_tasks.lock
+
+.agents
+AGENTS.md
+
+# Internal working docs, never committed
+docs/maintainer-guide.md
+docs/drafts/
+forks.md
