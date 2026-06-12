@@ -39,6 +39,13 @@ groups/*
 .nanoclaw/
 
 agents-sdk-docs
+.agents
+AGENTS.md
+
+# Internal working docs, never committed
+docs/maintainer-guide.md
+docs/drafts/
+forks.md
 
 # Per-installation scheduled-task lock (transient runtime state)
 .claude/scheduled_tasks.lock
