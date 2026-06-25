@@ -14,6 +14,7 @@
  * Storage is a JSON file at data/telegram-pairings.json — single-process,
  * read-modify-write under an in-process mutex.
  */
+import { randomInt } from 'node:crypto';
 import fs from 'fs';
 import path from 'path';
 
@@ -106,10 +107,10 @@ function sweep(store: Store): boolean {
 
 function generateCode(active: Set<string>): string {
   // 4-digit numeric, zero-padded. 10k space, fine for one-at-a-time intents.
+  // CSPRNG (not Math.random) — the code gates owner promotion, and a single
+  // wrong guess invalidates the pairing, so unpredictability is the real guard.
   for (let i = 0; i < 50; i++) {
-    const code = Math.floor(Math.random() * 10000)
-      .toString()
-      .padStart(4, '0');
+    const code = randomInt(0, 10000).toString().padStart(4, '0');
     if (!active.has(code)) return code;
   }
   throw new Error('Could not allocate a free pairing code (too many active).');
