@@ -5,6 +5,7 @@ import path from 'path';
 import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
+import { TIMEZONE, formatNow } from '../timezone.js';
 import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, McpServerConfig, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 
@@ -394,7 +395,12 @@ export class ClaudeProvider implements AgentProvider {
     const stream = new MessageStream();
     stream.push(input.prompt);
 
-    const instructions = input.systemContext?.instructions;
+    // Prepend an authoritative current date+time (with weekday) so the agent
+    // never has to compute the day-of-week from the preset's bare ISO date —
+    // computed at query time so it stays fresh across a long-lived container.
+    const nowLine = `Current date and time: ${formatNow(TIMEZONE)} (${TIMEZONE}). Treat this as "now" for any date/day/time question; do not recompute the weekday.`;
+    const baseInstructions = input.systemContext?.instructions;
+    const instructions = baseInstructions ? `${nowLine}\n\n${baseInstructions}` : nowLine;
 
     const sdkResult = sdkQuery({
       prompt: stream,

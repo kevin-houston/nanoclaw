@@ -48,6 +48,26 @@ export function formatLocalTime(utcIso: string, timezone: string): string {
   });
 }
 
+/**
+ * Current wall-clock time in `timezone`, including the weekday — the
+ * authoritative "now" handed to the agent each turn. The claude_code preset's
+ * "Today's date" is a bare ISO date with no weekday, and models compute the
+ * day-of-week from it unreliably (off-by-one is common). Stating the weekday
+ * explicitly removes the guess.
+ */
+export function formatNow(timezone: string): string {
+  return new Date().toLocaleString('en-US', {
+    timeZone: resolveTimezone(timezone),
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  });
+}
+
 function resolveContainerTimezone(): string {
   const candidates = [process.env.TZ, Intl.DateTimeFormat().resolvedOptions().timeZone];
   for (const tz of candidates) {

@@ -76,6 +76,32 @@ export function writeMessageOut(msg: WriteMessageOut): number {
   return nextSeq;
 }
 
+/** Highest seq currently in outbound — scopes same-turn duplicate detection. */
+export function getMaxOutboundSeq(): number {
+  return (getOutboundDb().prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM messages_out').get() as { m: number }).m;
+}
+
+/**
+ * True if an outbound row with identical routing + content was already written
+ * since `sinceSeq`. Used to drop a final `<message>` block that merely repeats
+ * something the agent already delivered via `send_message` earlier in the same
+ * turn — both write here, so the user would otherwise see it twice.
+ */
+export function outboundDuplicateSince(
+  sinceSeq: number,
+  platformId: string | null,
+  channelType: string | null,
+  content: string,
+): boolean {
+  const row = getOutboundDb()
+    .prepare(
+      `SELECT 1 FROM messages_out
+       WHERE seq > ? AND platform_id IS ? AND channel_type IS ? AND content = ? LIMIT 1`,
+    )
+    .get(sinceSeq, platformId, channelType, content);
+  return !!row;
+}
+
 /**
  * Look up a message's platform ID by seq number.
  * Searches both inbound and outbound DBs since seq spans both.

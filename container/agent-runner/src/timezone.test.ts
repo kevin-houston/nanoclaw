@@ -1,6 +1,24 @@
 import { describe, it, expect } from 'bun:test';
 
-import { formatLocalTime, isValidTimezone, parseZonedToUtc, resolveTimezone } from './timezone.js';
+import { formatLocalTime, formatNow, isValidTimezone, parseZonedToUtc, resolveTimezone } from './timezone.js';
+
+// --- formatNow ---
+
+describe('formatNow', () => {
+  it('includes the correct current weekday so the agent never guesses day-of-week', () => {
+    const out = formatNow('America/Chicago');
+    // The weekday is the whole point — must be present and match an independent
+    // computation. A regression that drops `weekday: 'long'` fails here.
+    const expectedWeekday = new Date().toLocaleDateString('en-US', { timeZone: 'America/Chicago', weekday: 'long' });
+    expect(out).toContain(expectedWeekday);
+  });
+
+  it('falls back to UTC for an invalid timezone', () => {
+    const out = formatNow('NotAZone');
+    const expectedWeekday = new Date().toLocaleDateString('en-US', { timeZone: 'UTC', weekday: 'long' });
+    expect(out).toContain(expectedWeekday);
+  });
+});
 
 // --- formatLocalTime ---
 

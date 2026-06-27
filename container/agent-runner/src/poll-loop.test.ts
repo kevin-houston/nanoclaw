@@ -438,6 +438,59 @@ describe('error result with no <message> envelope', () => {
   });
 });
 
+describe('final <message> dedup against same-turn send_message', () => {
+  const TG_ROUTING = { platformId: 'telegram:123', channelType: 'telegram', threadId: null, inReplyTo: 'm1' };
+
+  function seedTgDestination(): void {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('tg', 'tg', 'channel', 'telegram', 'telegram:123', NULL)`,
+      )
+      .run();
+  }
+
+  /** Query that simulates a mid-turn send_message write, then a final <message> block. */
+  function makeQueryWithMidTurnSend(midTurnText: string, finalBlock: string): AgentQuery {
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      const { writeMessageOut } = await import('./db/messages-out.js');
+      writeMessageOut({
+        id: 'sm-1',
+        kind: 'chat',
+        platform_id: 'telegram:123',
+        channel_type: 'telegram',
+        thread_id: null,
+        content: JSON.stringify({ text: midTurnText }),
+      });
+      yield { type: 'result', text: finalBlock };
+    }
+    return { push: () => {}, end: () => {}, events: events(), abort: () => {} };
+  }
+
+  it('drops the final block when it repeats the send_message content', async () => {
+    seedTgDestination();
+    const query = makeQueryWithMidTurnSend('Hello', '<message to="tg">Hello</message>');
+
+    await processQuery(query, TG_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1); // only the send_message row, not the repeat
+    expect(JSON.parse(out[0].content).text).toBe('Hello');
+  });
+
+  it('keeps the final block when its content differs from the send_message', async () => {
+    seedTgDestination();
+    const query = makeQueryWithMidTurnSend('On it', '<message to="tg">Here is the answer</message>');
+
+    await processQuery(query, TG_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(2);
+    expect(out.map((m) => JSON.parse(m.content).text).sort()).toEqual(['Here is the answer', 'On it']);
+  });
+});
+
 describe('isCorruptionError', () => {
   it('matches the Docker Desktop macOS torn-read symptom', () => {
     expect(isCorruptionError('database disk image is malformed')).toBe(true);

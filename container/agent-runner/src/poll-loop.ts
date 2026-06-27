@@ -1,6 +1,6 @@
 import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
 import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } from './db/messages-in.js';
-import { writeMessageOut } from './db/messages-out.js';
+import { writeMessageOut, getMaxOutboundSeq, outboundDuplicateSince } from './db/messages-out.js';
 import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import { clearContinuation, migrateLegacyContinuation, setContinuation } from './db/session-state.js';
 import { clearCurrentInReplyTo, setCurrentInReplyTo } from './current-batch.js';
@@ -459,6 +459,12 @@ export async function processQuery(
     })();
   }, ACTIVE_POLL_INTERVAL_MS);
 
+  // Outbound seq at the start of the current turn. Anything written past this
+  // point is this turn's output — used to drop a final <message> block that
+  // just repeats what the agent already sent via send_message this turn.
+  // Advanced after each result so a later turn's window starts fresh.
+  let turnStartSeq = getMaxOutboundSeq();
+
   try {
     for await (const event of query.events) {
       handleEvent(event, routing);
@@ -482,7 +488,7 @@ export async function processQuery(
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
         if (event.text) {
-          const { sent, hasUnwrapped } = dispatchResultText(event.text, routing);
+          const { sent, hasUnwrapped } = dispatchResultText(event.text, routing, turnStartSeq);
           if (sent === 0 && event.isError === true) {
             // Non-retryable error turn (e.g. a 403 billing_error) with no
             // <message> envelope: deliver the notice instead of dropping it as
@@ -522,6 +528,8 @@ export async function processQuery(
         } else {
           archivePrompts.shift();
         }
+        // Next turn's same-content window starts after this turn's writes.
+        turnStartSeq = getMaxOutboundSeq();
       }
     }
   } catch (err) {
@@ -600,7 +608,11 @@ function deliverErrorResult(text: string, routing: RoutingContext): void {
  * The agent must always wrap output in <message to="name">...</message>
  * blocks, even with a single destination. Bare text is scratchpad only.
  */
-function dispatchResultText(text: string, routing: RoutingContext): { sent: number; hasUnwrapped: boolean } {
+function dispatchResultText(
+  text: string,
+  routing: RoutingContext,
+  turnStartSeq: number,
+): { sent: number; hasUnwrapped: boolean } {
   const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
 
   let match: RegExpExecArray | null;
@@ -622,7 +634,10 @@ function dispatchResultText(text: string, routing: RoutingContext): { sent: numb
       scratchpadParts.push(`[dropped: unknown destination "${toName}"] ${body}`);
       continue;
     }
-    sendToDestination(dest, body, routing);
+    // `sent` counts the block as delivered even when the write is skipped as a
+    // duplicate — the content already reached the user via send_message, so it
+    // must not count as "unwrapped" (which would trigger the re-wrap nudge).
+    sendToDestination(dest, body, routing, turnStartSeq);
     sent++;
   }
   if (lastIndex < text.length) {
@@ -642,9 +657,24 @@ function dispatchResultText(text: string, routing: RoutingContext): { sent: numb
   return { sent, hasUnwrapped };
 }
 
-function sendToDestination(dest: DestinationEntry, body: string, routing: RoutingContext): void {
+function sendToDestination(
+  dest: DestinationEntry,
+  body: string,
+  routing: RoutingContext,
+  turnStartSeq: number,
+): void {
   const platformId = dest.type === 'channel' ? dest.platformId! : dest.agentGroupId!;
   const channelType = dest.type === 'channel' ? dest.channelType! : 'agent';
+  const content = JSON.stringify({ text: body });
+
+  // Drop a final <message> block that just repeats something already sent this
+  // turn via send_message (the model sometimes does both — same delivery
+  // channel, so the user would see it twice). Exact routing+content match only.
+  if (outboundDuplicateSince(turnStartSeq, platformId, channelType, content)) {
+    log(`Skipping final <message> to ${dest.name} — identical content already sent this turn`);
+    return;
+  }
+
   // Resolve thread_id per-destination from the most recent inbound message
   // that came from this same channel+platform. In agent-shared sessions,
   // different destinations have different thread contexts — using a single
@@ -657,7 +687,7 @@ function sendToDestination(dest: DestinationEntry, body: string, routing: Routin
     platform_id: platformId,
     channel_type: channelType,
     thread_id: destRouting?.threadId ?? null,
-    content: JSON.stringify({ text: body }),
+    content,
   });
 }
 
