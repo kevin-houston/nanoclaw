@@ -14,6 +14,7 @@ const envConfig = readEnvFile([
   'ONECLI_API_KEY',
   'TZ',
   'CONTAINER_ENV_PASSTHROUGH',
+  'DEFAULT_AGENT_PROVIDER',
   'CONTAINER_CPU_LIMIT',
   'CONTAINER_MEMORY_LIMIT',
   'NANOCLAW_EGRESS_LOCKDOWN',
@@ -21,7 +22,29 @@ const envConfig = readEnvFile([
   'ONECLI_GATEWAY_CONTAINER',
 ]);
 
+/**
+ * @deprecated WhatsApp adapter copies now read the ASSISTANT_NAME .env key
+ * directly. Re-export retained one release for stale adapter copies
+ * (origin/channels whatsapp.ts:42 imports it); scheduled for deletion.
+ */
 export const ASSISTANT_NAME = process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
+
+// Instance-wide default agent provider for newly created groups. `claude` (the
+// built-in provider) when unset, so existing installs are unaffected on upgrade.
+// Applied only at group-creation time (stamped onto the config row) — never in
+// provider resolution — so existing groups are never retroactively flipped.
+// Per-group `ncl groups config update --provider` still overrides it.
+export const DEFAULT_AGENT_PROVIDER = (
+  process.env.DEFAULT_AGENT_PROVIDER ||
+  envConfig.DEFAULT_AGENT_PROVIDER ||
+  'claude'
+).toLowerCase();
+
+/**
+ * @deprecated WhatsApp adapter copies now read the ASSISTANT_HAS_OWN_NUMBER
+ * .env key directly. Re-export retained one release for stale adapter copies
+ * (origin/channels whatsapp.ts:42 imports it); scheduled for deletion.
+ */
 export const ASSISTANT_HAS_OWN_NUMBER =
   (process.env.ASSISTANT_HAS_OWN_NUMBER || envConfig.ASSISTANT_HAS_OWN_NUMBER) === 'true';
 export const OLLAMA_ADMIN_TOOLS = (process.env.OLLAMA_ADMIN_TOOLS || envConfig.OLLAMA_ADMIN_TOOLS) === 'true';
