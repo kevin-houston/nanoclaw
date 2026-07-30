@@ -26,6 +26,7 @@ export interface ContainerConfigRow {
   additional_mounts: string; // JSON: AdditionalMountConfig[]
   privileged_mounts: string; // JSON: AdditionalMountConfig[] — bypasses mount-security
   cli_scope: string; // 'disabled' | 'group' | 'global'
+  timezone: string | null; // IANA id; NULL = follow the install-global timezone
   updated_at: string;
 }
 
