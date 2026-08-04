@@ -408,6 +408,9 @@ export async function processQuery(
         const newMessages = pending.filter((m) => m.kind !== 'system');
         if (newMessages.length === 0) return;
 
+        // Accumulated context must not engage a warm query by itself.
+        if (!newMessages.some((m) => m.trigger === 1)) return;
+
         const newIds = newMessages.map((m) => m.id);
         markProcessing(newIds);
 
@@ -717,12 +720,12 @@ export function dispatchResultText(
         thread_id: destThread,
         content: JSON.stringify({ text: scratchpad }),
       });
-      return { sent: 1, hasUnwrapped: false };
+      return { sent: 1, hasUnwrapped: false, taskBlocks };
     }
     const all = getAllDestinations();
     if (all.length === 1) {
       sendToDestination(all[0], scratchpad, routing);
-      return { sent: 1, hasUnwrapped: false };
+      return { sent: 1, hasUnwrapped: false, taskBlocks };
     }
   }
 
