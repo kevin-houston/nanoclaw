@@ -17,6 +17,3 @@ import './discord.js';
 // slack
 
 // whatsapp
-
-// emacs
-import './emacs.js';
