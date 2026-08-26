@@ -61,6 +61,13 @@ describe('extractCode', () => {
     expect(extractCode('my pin is 034927', 'nanobot')).toBeNull();
     expect(extractCode('034927 thanks', 'nanobot')).toBeNull();
   });
+  it('accepts the code as copied from the setup card (spaced digits)', () => {
+    expect(extractCode('0   3   4   9   2   7', 'nanobot')).toBe('034927');
+    expect(extractCode(' 0 3 4 9 2 7 ', 'nanobot')).toBe('034927');
+  });
+  it('accepts spaced digits after @botname', () => {
+    expect(extractCode('@nanobot 0   3   4   9   2   7', 'nanobot')).toBe('034927');
+  });
 });
 
 describe('createPairing', () => {
@@ -106,6 +113,18 @@ describe('tryConsume', () => {
       isGroup: false,
     });
     expect(out).toBeNull();
+  });
+
+  it('consumes a code pasted as the setup card displays it (spaced)', async () => {
+    const r = await createPairing('main');
+    const out = await tryConsume({
+      text: r.code.split('').join('   '),
+      botUsername: 'nanobot',
+      platformId: 'x',
+      isGroup: false,
+    });
+    expect(out).not.toBeNull();
+    expect(out!.status).toBe('consumed');
   });
 
   it('matches a bare code without @botname addressing', async () => {
@@ -244,5 +263,65 @@ describe('intent passthrough', () => {
     const cb = await tryConsume({ text: `@b ${b.code}`, botUsername: 'b', platformId: 'p2', isGroup: true });
     expect(ca!.intent).toEqual({ kind: 'wire-to', folder: 'work' });
     expect(cb!.intent).toEqual({ kind: 'new-agent', folder: 'side' });
+  });
+});
+
+describe('instance isolation', () => {
+  // Kill conditions: drop the `(r.instance ?? DEFAULT_INSTANCE) === instance`
+  // guard from tryConsume's match and one bot's code pairs on another bot;
+  // drop it from the miss loop and a wrong guess on one bot cancels the other
+  // bot's pending code; drop it from createPairing's supersede loop and
+  // starting a pairing on bot B invalidates bot A's in-flight pairing for the
+  // same intent.
+  it('stamps the instance on the record, the default bot when omitted', async () => {
+    expect((await createPairing('main')).instance).toBe('telegram');
+    expect((await createPairing('main', 'telegram-mega')).instance).toBe('telegram-mega');
+  });
+
+  it("a wrong guess on one bot invalidates only that bot's pending codes", async () => {
+    const a = await createPairing('main');
+    const b = await createPairing('main', 'telegram-mega');
+    await tryConsume({ text: '999999', botUsername: 'a', platformId: 'p', isGroup: false });
+    expect(getStatus(a.code)).toBe('invalidated');
+    expect(getStatus(b.code)).toBe('pending');
+    expect(getPairing(b.code)?.attempts ?? []).toHaveLength(0);
+  });
+
+  it("one bot's code is rejected on another bot and stays consumable on its own", async () => {
+    const a = await createPairing('main');
+    const onB = await tryConsume({
+      text: a.code,
+      botUsername: 'b',
+      platformId: 'p',
+      isGroup: false,
+      instance: 'telegram-mega',
+    });
+    expect(onB).toBeNull();
+    expect(getStatus(a.code)).toBe('pending');
+    const onA = await tryConsume({ text: a.code, botUsername: 'a', platformId: 'p', isGroup: false });
+    expect(onA?.status).toBe('consumed');
+  });
+
+  it('replace-by-default is scoped to the instance: the same intent can be pending on two bots', async () => {
+    const a = await createPairing('main');
+    const b = await createPairing('main', 'telegram-mega');
+    expect(getStatus(a.code)).toBe('pending');
+    expect(getStatus(b.code)).toBe('pending');
+  });
+
+  it('a legacy record without an instance field pairs on the default bot only', async () => {
+    const legacy = { code: '123456', intent: 'main', createdAt: new Date().toISOString(), status: 'pending' };
+    fs.writeFileSync(path.join(tmpDir, 'pairings.json'), JSON.stringify({ pairings: [legacy] }));
+    const onMega = await tryConsume({
+      text: '123456',
+      botUsername: 'b',
+      platformId: 'p',
+      isGroup: false,
+      instance: 'telegram-mega',
+    });
+    expect(onMega).toBeNull();
+    expect(getStatus('123456')).toBe('pending');
+    const onDefault = await tryConsume({ text: '123456', botUsername: 'b', platformId: 'p', isGroup: false });
+    expect(onDefault?.status).toBe('consumed');
   });
 });
