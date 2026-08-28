@@ -13,7 +13,6 @@ const envConfig = readEnvFile([
   'ONECLI_URL',
   'ONECLI_API_KEY',
   'TZ',
-  'CONTAINER_ENV_PASSTHROUGH',
   'DEFAULT_AGENT_PROVIDER',
   'CONTAINER_CPU_LIMIT',
   'CONTAINER_MEMORY_LIMIT',
@@ -60,6 +59,7 @@ export const SENDER_ALLOWLIST_PATH = path.join(HOME_DIR, '.config', 'nanoclaw', 
 export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
 export const GROUPS_DIR = path.resolve(PROJECT_ROOT, 'groups');
 export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
+export const CENTRAL_DB_PATH = path.join(DATA_DIR, 'v2.db');
 // Local agent-template library. Committed but ships empty (+ README). Resolved
 // once at load. Override to another LOCAL path via NANOCLAW_TEMPLATES_DIR; never
 // a remote URL, never an ncl flag, never runtime-mutable.
@@ -71,8 +71,9 @@ export const TEMPLATES_DIR = process.env.NANOCLAW_TEMPLATES_DIR
 // `nanoclaw-agent:latest` and clobber each other on rebuild.
 export const CONTAINER_IMAGE_BASE = process.env.CONTAINER_IMAGE_BASE || getContainerImageBase(PROJECT_ROOT);
 export const CONTAINER_IMAGE = process.env.CONTAINER_IMAGE || getDefaultContainerImage(PROJECT_ROOT);
-// Install slug — stamped onto every spawned container via --label so
-// cleanupOrphans only reaps containers from this install, not peers.
+// Install slug — the session key's install component, stamped onto every
+// runtime object via the canonical `nanoclaw-install` label so adoption and
+// reaping only ever see this install's sessions, not a peer's.
 export const INSTALL_SLUG = getInstallSlug(PROJECT_ROOT);
 export const CONTAINER_INSTALL_LABEL = `nanoclaw-install=${INSTALL_SLUG}`;
 export const ONECLI_URL = process.env.ONECLI_URL || envConfig.ONECLI_URL;
@@ -108,11 +109,3 @@ function resolveConfigTimezone(): string {
   return 'UTC';
 }
 export const TIMEZONE = resolveConfigTimezone();
-
-// Comma-separated list of env var names to forward from .env into containers.
-// Example: CONTAINER_ENV_PASSTHROUGH=OPENAI_API_KEY,FMP_API_KEY
-const passthroughRaw = process.env.CONTAINER_ENV_PASSTHROUGH || envConfig.CONTAINER_ENV_PASSTHROUGH || '';
-export const CONTAINER_ENV_PASSTHROUGH: string[] = passthroughRaw
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean);
