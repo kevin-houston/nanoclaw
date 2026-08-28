@@ -902,7 +902,6 @@ export function syncSkillSymlinks(
   }
 }
 
-
 /**
  * Resolve the group's skill selection to concrete names — `'all'` recomputes
  * from `container/skills/` so newly-added upstream skills appear automatically.
