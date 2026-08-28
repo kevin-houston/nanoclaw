@@ -33,7 +33,10 @@ import { registerProviderContainerConfig } from './provider-container-registry.j
 function placeholderEnv(): Record<string, string> {
   const raw = readEnvFile(['CONTAINER_ENV_PLACEHOLDERS']).CONTAINER_ENV_PLACEHOLDERS ?? '';
   const env: Record<string, string> = {};
-  for (const name of raw.split(',').map((s) => s.trim()).filter(Boolean)) {
+  for (const name of raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)) {
     env[name] = 'placeholder';
   }
   return env;
