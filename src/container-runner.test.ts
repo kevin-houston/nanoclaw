@@ -10,7 +10,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { CONTAINER_CPU_LIMIT, CONTAINER_MEMORY_LIMIT } from './config.js';
 import type { ContainerConfig } from './container-config.js';
@@ -18,6 +18,7 @@ import {
   armSessionLifecycle,
   composeSessionSpec,
   parseMemoryMb,
+  privilegedMountGids,
   parsePidsLimit,
   resolveProviderName,
   syncSkillSymlinks,
@@ -306,6 +307,30 @@ describe('composeSessionSpec', () => {
     }
   });
 
+  it('carries the privileged-mount groups onto the spec, so the identity can use what was mounted', () => {
+    // The link between derivation and realization: without this the gids are
+    // computed and silently dropped, and the mount stays unusable.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'compose-gid-'));
+    const sock = path.join(dir, 'docker.sock');
+    fs.writeFileSync(sock, '');
+    try {
+      const spec = compose({
+        containerConfig: {
+          ...containerConfig,
+          privilegedMounts: [{ hostPath: sock, containerPath: '/var/run/docker.sock' }],
+        } as unknown as ContainerConfig,
+      });
+      const gid = fs.statSync(sock).gid;
+      if (gid !== 0 && spec.runAs) expect(spec.runAsGroups).toEqual([gid]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('asks for no supplementary groups when the group has no privileged mounts', () => {
+    expect(compose().runAsGroups).toBeUndefined();
+  });
+
   it('never asks a runtime to run the session as root', () => {
     // The hardened posture pins non-root, so a composed uid-0 runAs could never
     // be realized; Docker's root behavior (image USER wins) stays unchanged.
@@ -328,6 +353,37 @@ describe('composeSessionSpec', () => {
     expect(spec.resources.cpus).toBeUndefined();
     expect(spec.resources.memoryMb).toBeUndefined();
     expect(spec.resources.shmSizeMb).toBe(1024);
+  });
+});
+
+describe('privilegedMountGids', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'privgid-'));
+  const owned = path.join(tmp, 'sock');
+
+  beforeAll(() => {
+    fs.writeFileSync(owned, '');
+  });
+  afterAll(() => {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it('returns undefined when the group has no privileged mounts', () => {
+    expect(privilegedMountGids(undefined)).toBeUndefined();
+    expect(privilegedMountGids([])).toBeUndefined();
+  });
+
+  it('derives the owning gid of a real privileged mount', () => {
+    const gid = fs.statSync(owned).gid;
+    const result = privilegedMountGids([{ hostPath: owned, containerPath: '/sock' }] as never);
+    // gid 0 is deliberately skipped, so only assert the grant when the test
+    // file is not root-owned — which it is not under any normal test runner.
+    if (gid === 0) expect(result).toBeUndefined();
+    else expect(result).toEqual([gid]);
+  });
+
+  it('warns instead of failing the spawn when a privileged mount cannot be stat-ed', () => {
+    expect(privilegedMountGids([{ hostPath: '/nope/missing.sock', containerPath: '/s' }] as never)).toBeUndefined();
+    expect(log.warn).toHaveBeenCalledWith('Could not stat privileged mount for gid', expect.anything());
   });
 });
 

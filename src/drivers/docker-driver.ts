@@ -653,7 +653,12 @@ export function resourceArgs(spec: SessionSpec): string[] {
 }
 
 export function userArgs(spec: SessionSpec): string[] {
-  return spec.runAs ? ['--user', `${spec.runAs.uid}:${spec.runAs.gid}`] : [];
+  if (!spec.runAs) return [];
+  const args = ['--user', `${spec.runAs.uid}:${spec.runAs.gid}`];
+  // Numeric gids need no /etc/group entry inside the image, so a host group the
+  // container has never heard of still grants access to what it owns.
+  for (const gid of spec.runAsGroups ?? []) args.push('--group-add', String(gid));
+  return args;
 }
 
 export function mountArgs(mounts: readonly MountSpec[]): string[] {

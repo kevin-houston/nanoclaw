@@ -138,6 +138,18 @@ export interface SessionSpec {
    * inherited from the image.
    */
   runAs?: { uid: number; gid: number };
+  /**
+   * Supplementary group ids the containers join, beyond `runAs.gid`.
+   *
+   * `runAs` carries a single uid:gid, and a host process's supplementary groups
+   * do NOT cross into a container. So an `allowlisted-extra` mount of a host
+   * socket or device that is group-readable rather than world-readable —
+   * `/var/run/docker.sock` is `root:docker 0660` — is unusable by the identity
+   * the spec pins, even when the host user running the install is in that
+   * group. This is typed identity, a sibling of `runAs`, not a raw runtime
+   * flag: composition derives it from what it mounted, and admission can see it.
+   */
+  runAsGroups?: number[];
   /** Grace before SIGKILL. Docker `stop -t`, or the realization's termination grace. */
   stopGraceSeconds: number;
 }

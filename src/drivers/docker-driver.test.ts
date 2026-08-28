@@ -122,6 +122,22 @@ describe('spec realization', () => {
     expect(createArgs().join(' ')).toContain('--user 501:1000');
   });
 
+  it('joins the spec supplementary groups, so a group-owned mount is usable by the pinned identity', async () => {
+    // /var/run/docker.sock is root:docker 0660: present but unreadable to
+    // `--user 501:1000` alone, because host supplementary groups do not cross
+    // into the container.
+    await driver().prepare(fixtureSpec({ runAsGroups: [121, 999] }));
+    const args = createArgs().join(' ');
+
+    expect(args).toContain('--group-add 121');
+    expect(args).toContain('--group-add 999');
+  });
+
+  it('adds no groups when the spec asks for none', async () => {
+    await driver().prepare(fixtureSpec());
+    expect(createArgs().join(' ')).not.toContain('--group-add');
+  });
+
   it('mounts read-only where the spec says ro, and read-write otherwise', async () => {
     await driver().prepare(fixtureSpec());
     const args = createArgs();

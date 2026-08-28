@@ -663,6 +663,29 @@ export function mergeMounts(composed: MountSpec[], contributed: MountSpec[]): Mo
 }
 
 /**
+ * Owning gids of the group's privileged mounts, for the spec's supplementary
+ * group lane. Root-owned groups are skipped: gid 0 grants nothing the identity
+ * does not already have and would be a real privilege grant if it did.
+ * A mount that cannot be stat'ed is warned about, not fatal — refusing to spawn
+ * over one unreadable path would take the whole agent down.
+ */
+export function privilegedMountGids(
+  mounts: import('./container-config.js').AdditionalMountConfig[] | undefined,
+): number[] | undefined {
+  if (!mounts || mounts.length === 0) return undefined;
+  const gids = new Set<number>();
+  for (const m of mounts) {
+    try {
+      const stat = fs.statSync(m.hostPath);
+      if (stat.gid !== 0) gids.add(stat.gid);
+    } catch (err) {
+      log.warn('Could not stat privileged mount for gid', { hostPath: m.hostPath, err });
+    }
+  }
+  return gids.size > 0 ? [...gids] : undefined;
+}
+
+/**
  * Compose the session spec. This is the tail of the old `buildContainerArgs`,
  * with argv assembly removed: the host says what a session *is*, the driver
  * says how it is realized.
@@ -703,6 +726,13 @@ export function composeSessionSpec(input: ComposeSessionSpecInput): SessionSpec 
   // image, so it is writable by any uid under both drivers.
   const runAs = hostUid != null && hostUid !== 0 ? { uid: hostUid, gid: hostGid ?? hostUid } : undefined;
   if (runAs) env.HOME = '/home/node';
+  // Privileged mounts land at an absolute host path the operator chose, and are
+  // often group-owned rather than world-readable (/var/run/docker.sock is
+  // root:docker 0660). `runAs` pins one uid:gid and supplementary groups do not
+  // cross the container boundary, so without this the mount is present and
+  // unusable. Derived from what composition actually mounted, so the grant can
+  // never outlive the mount that justifies it.
+  const runAsGroups = runAs ? privilegedMountGids(containerConfig.privilegedMounts) : undefined;
 
   const agent: ContainerSpec = {
     role: 'agent',
@@ -756,6 +786,7 @@ export function composeSessionSpec(input: ComposeSessionSpecInput): SessionSpec 
     // (validateSpec, against capabilities().isolationTiers).
     runtimeTier: containerConfig.runtimeTier ?? 'container',
     runAs,
+    runAsGroups,
     stopGraceSeconds: STOP_GRACE_SECONDS,
   };
 }
