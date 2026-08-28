@@ -710,7 +710,18 @@ export function composeSessionSpec(input: ComposeSessionSpecInput): SessionSpec 
   // stays inside the no-credentials-in-env invariant. It rides the contributed
   // lane because the composed lane's name check refuses any `*_KEY` key.
   // Remove this only if the vault switches to real x-api-key injection.
-  if ('ANTHROPIC_API_KEY' in contributedEnv) contributedEnv.ANTHROPIC_API_KEY = '';
+  if ('ANTHROPIC_API_KEY' in contributedEnv) {
+    contributedEnv.ANTHROPIC_API_KEY = '';
+    // ...and say "logged in" the way the SDK understands. An empty API key
+    // alone leaves it with no credential at all ("Not logged in · Please run
+    // /login"), because the SDK decides auth from its own env, never from the
+    // proxy. ANTHROPIC_AUTH_TOKEN makes it emit `Authorization: Bearer
+    // placeholder`, which the vault's api.anthropic.com secret overwrites on
+    // the wire — the exact pattern src/providers/claude.ts documents for
+    // custom endpoints. That provider only registers when ANTHROPIC_BASE_URL
+    // is set, so a stock install pointed at api.anthropic.com needs it here.
+    contributedEnv.ANTHROPIC_AUTH_TOKEN ??= 'placeholder';
+  }
 
   // CONTAINER_ENV_PASSTHROUGH forwards listed .env vars to every container, for
   // config the OneCLI vault does not manage. These are operator-chosen names
