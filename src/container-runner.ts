@@ -695,6 +695,23 @@ export function composeSessionSpec(input: ComposeSessionSpecInput): SessionSpec 
     ...(gateway.env ?? {}),
   };
 
+  // Clear ANTHROPIC_API_KEY after the gateway contribution.
+  //
+  // This install authenticates to Anthropic with an OAuth (subscription)
+  // credential the OneCLI vault injects as `Authorization: Bearer <token>`.
+  // The SDK's apply surface also emits `ANTHROPIC_API_KEY=placeholder`, which
+  // the Agent SDK forwards as an `x-api-key` header — and Anthropic rejects
+  // the whole request on that header before the valid Authorization one is
+  // considered. Measured against the live proxy: with the placeholder
+  // x-api-key the call is 401 `invalid x-api-key`; with it cleared the same
+  // call authenticates (429 rate-limit, not 401).
+  //
+  // An empty value is not a credential, so this carries nothing secret and
+  // stays inside the no-credentials-in-env invariant. It rides the contributed
+  // lane because the composed lane's name check refuses any `*_KEY` key.
+  // Remove this only if the vault switches to real x-api-key injection.
+  if ('ANTHROPIC_API_KEY' in contributedEnv) contributedEnv.ANTHROPIC_API_KEY = '';
+
   // CONTAINER_ENV_PASSTHROUGH forwards listed .env vars to every container, for
   // config the OneCLI vault does not manage. These are operator-chosen names
   // (typically `*_API_KEY`), so they ride the contributed lane, which is exempt
