@@ -27,7 +27,6 @@ import {
   stripInternalTags,
   type RoutingContext,
 } from './formatter.js';
-import { getSessionRouting } from './db/session-routing.js';
 import { stripHarnessTagArtifacts } from './harness-tag-strip.js';
 import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
@@ -1056,44 +1055,6 @@ export async function dispatchResultText(
   }
 
   const scratchpad = stripInternalTags(scratchpadParts.join(''));
-
-  // Single-destination shortcut: the agent wrote plain text — send to
-  // the session's bound user-facing channel (from session_routing) when
-  // available, otherwise fall back to the trigger message's routing.
-  //
-  // session_routing is preferred because the trigger message may be a
-  // system note (approval ack) or an a2a echo, both with channel_type='agent'
-  // and platform_id pointing back at this agent group — replying there
-  // would loop. session_routing reliably points at the user-facing channel
-  // the session is bound to.
-  if (sent === 0 && scratchpad) {
-    const session = getSessionRouting();
-    let destChannel: string | null = session.channel_type;
-    let destPlatform: string | null = session.platform_id;
-    let destThread: string | null = session.thread_id;
-    if ((!destChannel || !destPlatform) && routing.channelType !== 'agent') {
-      destChannel = routing.channelType;
-      destPlatform = routing.platformId;
-      destThread = routing.threadId;
-    }
-    if (destChannel && destPlatform) {
-      writeMessageOut({
-        id: generateId(),
-        in_reply_to: routing.inReplyTo,
-        kind: 'chat',
-        platform_id: destPlatform,
-        channel_type: destChannel,
-        thread_id: destThread,
-        content: JSON.stringify({ text: scratchpad }),
-      });
-      return { sent: 1, hasUnwrapped: false, taskBlocks };
-    }
-    const all = getAllDestinations();
-    if (all.length === 1) {
-      sendToDestination(all[0], scratchpad, routing);
-      return { sent: 1, hasUnwrapped: false, taskBlocks };
-    }
-  }
 
   if (scratchpad) {
     log(`[scratchpad] ${scratchpad.slice(0, 500)}${scratchpad.length > 500 ? '…' : ''}`);
