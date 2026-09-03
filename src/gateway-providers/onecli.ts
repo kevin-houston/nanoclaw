@@ -57,6 +57,41 @@ export function contributionFromArgs(args: readonly string[], groupScope: string
   return { env, mounts };
 }
 
+/**
+ * Gateway stubs that must not reach a Claude container with a non-empty value.
+ *
+ * The gateway advertises one placeholder env var per vault secret so agent code
+ * that reads `os.environ[...]` finds *a* value. For `api.anthropic.com` that
+ * stub is `ANTHROPIC_API_KEY=placeholder`, and it is actively harmful: the
+ * Agent SDK reads a non-empty `ANTHROPIC_API_KEY` as "authenticate with
+ * `x-api-key`" and sends `x-api-key: placeholder`. Our vault secret is
+ * header-injected as `Authorization: Bearer <oauth token>`, so the gateway ADDS
+ * the real Authorization header but leaves the bogus `x-api-key` beside it —
+ * and Anthropic honours `x-api-key` first and answers 401, while the gateway
+ * log still reads `injections_applied=1` as though auth had succeeded.
+ *
+ * Verified by A/B on 2026-08-29: dropping the stub → 8/8 `status=200`;
+ * restoring it → immediate 401. The peer install (nc/nc2/nanoclaw) never hit
+ * this because its `ANTHROPIC_API_KEY` arrives EMPTY, which the SDK treats as
+ * unset — the same end state this drop produces.
+ *
+ * Only the stub value is dropped. A real key would be a credential riding env,
+ * which the spec's admission check refuses anyway.
+ */
+const DROPPED_GATEWAY_ENV = new Set(['ANTHROPIC_API_KEY']);
+
+export function withoutConflictingStubs(env: Record<string, string>): Record<string, string> {
+  const kept: Record<string, string> = {};
+  for (const [name, value] of Object.entries(env)) {
+    if (DROPPED_GATEWAY_ENV.has(name) && value === 'placeholder') {
+      log.debug('Dropped gateway stub that would shadow the injected auth header', { name });
+      continue;
+    }
+    kept[name] = value;
+  }
+  return kept;
+}
+
 registerGatewayProvider('onecli', () => ({
   kind: 'onecli',
   async contribute({ key, groupName }) {
@@ -69,6 +104,7 @@ registerGatewayProvider('onecli', () => ({
       throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
     }
     log.info('OneCLI gateway applied', { agentGroupId: key.agentGroupId, sessionId: key.sessionId });
-    return contributionFromArgs(args, key.agentGroupId);
+    const contribution = contributionFromArgs(args, key.agentGroupId);
+    return { ...contribution, env: withoutConflictingStubs(contribution.env ?? {}) };
   },
 }));

@@ -45,9 +45,16 @@ function placeholderEnv(): Record<string, string> {
 registerProviderContainerConfig('claude', () => {
   const dotenv = readEnvFile(['ANTHROPIC_BASE_URL']);
   const env: Record<string, string> = placeholderEnv();
+  // Unconditional: the stock api.anthropic.com path needs this just as much as
+  // a custom endpoint does. Auth reaches the wire as the gateway's injected
+  // `Authorization: Bearer <token>`, and the SDK only emits an Authorization
+  // header at all when it sees ANTHROPIC_AUTH_TOKEN. Without it the SDK falls
+  // back to the gateway's `ANTHROPIC_API_KEY` stub and sends
+  // `x-api-key: placeholder`, which Anthropic honours first and rejects 401
+  // (see withoutConflictingStubs in gateway-providers/onecli.ts).
+  env.ANTHROPIC_AUTH_TOKEN = 'placeholder';
   if (dotenv.ANTHROPIC_BASE_URL) {
     env.ANTHROPIC_BASE_URL = dotenv.ANTHROPIC_BASE_URL;
-    env.ANTHROPIC_AUTH_TOKEN = 'placeholder';
   }
   return { env };
 });
