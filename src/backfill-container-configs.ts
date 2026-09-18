@@ -68,6 +68,7 @@ export async function backfillContainerConfigs(): Promise<void> {
       privileged_mounts: JSON.stringify(legacy.privilegedMounts ?? []),
       cli_scope: 'group',
       timezone: null,
+      speed: null,
       updated_at: new Date().toISOString(),
     };
 
