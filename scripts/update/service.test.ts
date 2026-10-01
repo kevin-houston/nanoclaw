@@ -7,18 +7,24 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  adoptUserRuntimeDir,
   CUTOVER_LIST_CLI_TIMEOUT_MS,
   CUTOVER_STOP_CLI_TIMEOUT_MS,
+  CONTROLLER_GATEWAY_ROLE,
   CUTOVER_STOP_GRACE_SECONDS,
+  DRAIN_LIST_FORMAT,
   createCommandRunner,
   detectService,
   drainContainers,
+  probe,
+  restartGatewayContainers,
   startService,
   stopService,
   verifyServiceHealth,
   type CommandRunner,
   type ServiceEnvironment,
 } from './service.js';
+import { GATEWAY_ROLE, LABELS } from '../../src/drivers/types.js';
 
 const roots: string[] = [];
 
@@ -28,7 +34,9 @@ function temp(): string {
   return root;
 }
 
-function makeEnv(platform: NodeJS.Platform, responses: Record<string, { ok: boolean; stdout?: string }> = {}) {
+type FakeResponse = { ok: boolean; stdout?: string; status?: number | null; stderr?: string };
+
+function makeEnv(platform: NodeJS.Platform, responses: Record<string, FakeResponse> = {}) {
   const home = temp();
   const calls: string[] = [];
   const runner: CommandRunner = {
@@ -36,7 +44,14 @@ function makeEnv(platform: NodeJS.Platform, responses: Record<string, { ok: bool
       const key = `${command} ${args.join(' ')}`;
       calls.push(key);
       const response = responses[key];
-      if (response && !response.ok) throw new Error(key);
+      if (response && !response.ok) {
+        // Same shape as execFileSync's error: exit status (null when unspawnable) + stderr.
+        throw Object.assign(new Error(`Command failed: ${key}\n${response.stderr ?? ''}`), {
+          status: response.status === undefined ? 1 : response.status,
+          stdout: response.stdout ?? '',
+          stderr: response.stderr ?? '',
+        });
+      }
       return response?.stdout ?? '';
     },
     tryRun(command, args) {
@@ -69,7 +84,7 @@ describe('service-mode detection and control', () => {
     const root = temp();
     const name = `nanoclaw-v2-${slug(root)}`;
     const { env, calls, home } = makeEnv('linux', {
-      [`systemctl --user is-active --quiet ${name}`]: { ok: true },
+      [`systemctl --user is-active ${name}`]: { ok: true },
     });
     const unit = path.join(home, '.config', 'systemd', 'user', `${name}.service`);
     fs.mkdirSync(path.dirname(unit), { recursive: true });
@@ -98,7 +113,7 @@ describe('service-mode detection and control', () => {
     const root = temp();
     const name = `com.nanoclaw-v2-${slug(root)}`;
     const { env, calls, home } = makeEnv('darwin', {
-      [`launchctl print gui/1000/${name}`]: { ok: false },
+      [`launchctl print gui/1000/${name}`]: { ok: false, status: 113, stderr: 'Could not find service' },
     });
     const plist = path.join(home, 'Library', 'LaunchAgents', `${name}.plist`);
     fs.mkdirSync(path.dirname(plist), { recursive: true });
@@ -134,16 +149,190 @@ describe('service-mode detection and control', () => {
   });
 });
 
+describe('liveness probes: running / stopped / probe failed', () => {
+  // The bug: `.ok` read every non-zero exit as "stopped". With no user bus
+  // (`su -`, cron, non-interactive SSH) systemctl fails before it can look,
+  // and cutover then skipped the stop, finish the restart, and the update
+  // reported complete against the stale host. Exit 3 is the only "stopped".
+  function userUnit(): { root: string; name: string; probeKey: string } {
+    const root = temp();
+    const name = `nanoclaw-v2-${slug(root)}`;
+    return { root, name, probeKey: `systemctl --user is-active ${name}` };
+  }
+  function writeUserUnit(home: string, name: string): void {
+    const unit = path.join(home, '.config', 'systemd', 'user', `${name}.service`);
+    fs.mkdirSync(path.dirname(unit), { recursive: true });
+    fs.writeFileSync(unit, '[Service]\n');
+  }
+  const busError = 'Failed to connect to bus: No medium found';
+
+  it('systemd --user: exit 3 is stopped, a bus error is a refusal that names the fix', () => {
+    const stopped = userUnit();
+    const env1 = makeEnv('linux', { [stopped.probeKey]: { ok: false, status: 3 } });
+    writeUserUnit(env1.home, stopped.name);
+    expect(detectService(stopped.root, env1.env)).toMatchObject({ mode: 'systemd-user', active: false });
+
+    const failed = userUnit();
+    const env2 = makeEnv('linux', { [failed.probeKey]: { ok: false, status: 1, stderr: busError } });
+    writeUserUnit(env2.home, failed.name);
+    expect(() => detectService(failed.root, env2.env)).toThrow(/Cannot tell whether NanoClaw is running/);
+    expect(() => detectService(failed.root, env2.env)).toThrow(/No medium found/);
+    expect(() => detectService(failed.root, env2.env)).toThrow(/XDG_RUNTIME_DIR=\/run\/user\/1000/);
+    // Nothing else ran: the refusal is the whole outcome.
+    expect(env2.calls).toEqual([failed.probeKey, failed.probeKey, failed.probeKey]);
+  });
+
+  it('a unit mid restart is stopped by cutover but never passes health', async () => {
+    const restarting = userUnit();
+    const { env, home, calls } = makeEnv('linux', {
+      [restarting.probeKey]: { ok: false, status: 3, stdout: 'deactivating' },
+      [`${path.join(restarting.root, 'bin', 'ncl')} groups list`]: { ok: true },
+    });
+    writeUserUnit(home, restarting.name);
+    const handle = detectService(restarting.root, env);
+    expect(handle).toMatchObject({ mode: 'systemd-user', active: true, transitional: true });
+    await stopService(handle, env);
+    expect(calls).toContain(`systemctl --user stop ${restarting.name}`);
+
+    fs.mkdirSync(path.join(restarting.root, 'data'), { recursive: true });
+    fs.writeFileSync(path.join(restarting.root, 'data', 'ncl.sock'), 'test socket stand-in');
+    let clock = 0;
+    const now = vi.spyOn(Date, 'now').mockImplementation(() => clock);
+    try {
+      env.sleep = async () => {
+        clock += 500;
+      };
+      await expect(
+        verifyServiceHealth({ ...handle, transitional: undefined }, restarting.root, env, 1_000),
+      ).resolves.toBe(false);
+    } finally {
+      now.mockRestore();
+    }
+    expect(calls).not.toContain(`${path.join(restarting.root, 'bin', 'ncl')} groups list`);
+  });
+
+  it('systemd (system unit): exit 3 is stopped, anything else refuses', () => {
+    // /etc/systemd/system is not writable from a test, so the system-unit
+    // branch is exercised through the shared helper with its exact arguments.
+    const args = ['is-active', 'nanoclaw-v2-x'];
+    const key = `systemctl ${args.join(' ')}`;
+    const stopped = makeEnv('linux', { [key]: { ok: false, status: 3, stdout: 'inactive' } });
+    expect(probe(stopped.env, 'systemctl', args, [3], 'hint')).toBeUndefined();
+    const running = makeEnv('linux', { [key]: { ok: true, stdout: 'active' } });
+    expect(probe(running.env, 'systemctl', args, [3], 'hint')).toEqual({ stdout: 'active', transitional: false });
+    const broken = makeEnv('linux', { [key]: { ok: false, status: 1, stderr: busError } });
+    expect(() => probe(broken.env, 'systemctl', args, [3], 'hint')).toThrow(/No medium found.*hint/s);
+    // Restart=always: a unit mid auto-restart also exits 3 but still holds the
+    // service, so it counts as running and gets stopped; `failed` is stopped.
+    const restarting = makeEnv('linux', { [key]: { ok: false, status: 3, stdout: 'activating' } });
+    expect(probe(restarting.env, 'systemctl', args, [3], 'hint')).toEqual({ stdout: 'activating', transitional: true });
+    const crashed = makeEnv('linux', { [key]: { ok: false, status: 3, stdout: 'failed' } });
+    expect(probe(crashed.env, 'systemctl', args, [3], 'hint')).toBeUndefined();
+  });
+
+  it('launchd: 113 (not loaded) is stopped, 112 (no domain, e.g. SSH without a GUI session) refuses', () => {
+    const root = temp();
+    const name = `com.nanoclaw-v2-${slug(root)}`;
+    const key = `launchctl print gui/1000/${name}`;
+    const notLoaded = makeEnv('darwin', { [key]: { ok: false, status: 113, stderr: 'Could not find service' } });
+    fs.mkdirSync(path.join(notLoaded.home, 'Library', 'LaunchAgents'), { recursive: true });
+    fs.writeFileSync(path.join(notLoaded.home, 'Library', 'LaunchAgents', `${name}.plist`), '<plist/>\n');
+    expect(detectService(root, notLoaded.env)).toMatchObject({ mode: 'launchd', active: false });
+
+    const noDomain = makeEnv('darwin', {
+      [key]: { ok: false, status: 112, stderr: 'Could not find domain for user gui: 1000' },
+    });
+    fs.mkdirSync(path.join(noDomain.home, 'Library', 'LaunchAgents'), { recursive: true });
+    fs.writeFileSync(path.join(noDomain.home, 'Library', 'LaunchAgents', `${name}.plist`), '<plist/>\n');
+    expect(() => detectService(root, noDomain.env)).toThrow(/Could not find domain/);
+
+    const loaded = makeEnv('darwin', { [key]: { ok: true, stdout: 'state = running' } });
+    fs.mkdirSync(path.join(loaded.home, 'Library', 'LaunchAgents'), { recursive: true });
+    fs.writeFileSync(path.join(loaded.home, 'Library', 'LaunchAgents', `${name}.plist`), '<plist/>\n');
+    expect(detectService(root, loaded.env)).toMatchObject({ mode: 'launchd', active: true });
+  });
+
+  it('pgrep: exit 1 is nothing running, an unspawnable pgrep refuses (real runner)', () => {
+    const root = temp();
+    const runner = createCommandRunner();
+    const { env } = makeEnv('linux');
+    env.runner = runner;
+    expect(detectService(root, env)).toEqual({ mode: 'none', active: false });
+
+    env.runner = {
+      run: (command, args, cwd) => runner.run(command === 'pgrep' ? 'pgrep-missing-zz' : command, args, cwd),
+      tryRun: runner.tryRun,
+    };
+    expect(() => detectService(root, env)).toThrow(/pgrep.*ENOENT.*Install procps/s);
+  });
+
+  it('adopts /run/user/<uid> as XDG_RUNTIME_DIR only when unset and present', () => {
+    const runRoot = temp();
+    const saved = process.env.XDG_RUNTIME_DIR;
+    try {
+      delete process.env.XDG_RUNTIME_DIR;
+      adoptUserRuntimeDir(1000, runRoot);
+      expect(process.env.XDG_RUNTIME_DIR).toBeUndefined();
+
+      fs.mkdirSync(path.join(runRoot, '1000'));
+      adoptUserRuntimeDir(1000, runRoot);
+      expect(process.env.XDG_RUNTIME_DIR).toBe(path.join(runRoot, '1000'));
+
+      process.env.XDG_RUNTIME_DIR = '/run/user/keep';
+      adoptUserRuntimeDir(1000, runRoot);
+      expect(process.env.XDG_RUNTIME_DIR).toBe('/run/user/keep');
+    } finally {
+      if (saved === undefined) delete process.env.XDG_RUNTIME_DIR;
+      else process.env.XDG_RUNTIME_DIR = saved;
+    }
+  });
+  it('verifyServiceHealth polls through a transient probe failure and reports a persistent one at the timeout', async () => {
+    const root = temp();
+    const name = `nanoclaw-v2-${slug(root)}`;
+    const key = `systemctl --user is-active ${name}`;
+    const { env, home } = makeEnv('linux', {
+      [`${path.join(root, 'bin', 'ncl')} groups list`]: { ok: true },
+    });
+    writeUserUnit(home, name);
+    fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'data', 'ncl.sock'), 'test socket stand-in');
+    const handle = { mode: 'systemd-user' as const, active: true, name };
+    let probes = 0;
+    env.runner.run = (command, args) => {
+      if (`${command} ${args.join(' ')}` !== key) return '';
+      probes += 1;
+      if (probes === 1) throw Object.assign(new Error('Command failed'), { status: 1, stderr: busError });
+      return '';
+    };
+    await expect(verifyServiceHealth(handle, root, env, 5_000)).resolves.toBe(true);
+    expect(probes).toBe(2);
+
+    let clock = 0;
+    const now = vi.spyOn(Date, 'now').mockImplementation(() => clock);
+    try {
+      env.sleep = async () => {
+        clock += 500;
+      };
+      env.runner.run = () => {
+        throw Object.assign(new Error('Command failed'), { status: 1, stderr: busError });
+      };
+      await expect(verifyServiceHealth(handle, root, env, 2_000)).rejects.toThrow(/No medium found/);
+    } finally {
+      now.mockRestore();
+    }
+  });
+});
+
 describe('drain and health gates', () => {
   it('filters active containers by this install slug', async () => {
     const root = temp();
     const label = `nanoclaw-install=${slug(root)}`;
     const { env, calls } = makeEnv('linux', {
-      [`docker ps -q --filter label=${label}`]: { ok: true, stdout: '' },
+      [`docker ps --filter label=${label} --format ${DRAIN_LIST_FORMAT}`]: { ok: true, stdout: '' },
     });
 
     await drainContainers(root, env);
-    expect(calls).toEqual([`docker ps -q --filter label=${label}`]);
+    expect(calls).toEqual([`docker ps --filter label=${label} --format ${DRAIN_LIST_FORMAT}`]);
   });
 
   it('stops the labeled containers itself, then waits for the runtime to list none (#3828)', async () => {
@@ -152,7 +341,7 @@ describe('drain and health gates', () => {
     // succeed: the drain must be the thing that stops them.
     const root = temp();
     const label = `nanoclaw-install=${slug(root)}`;
-    const ps = `docker ps -q --filter label=${label}`;
+    const ps = `docker ps --filter label=${label} --format ${DRAIN_LIST_FORMAT}`;
     let listings = 0;
     const { env, calls } = makeEnv('linux');
     env.runner.tryRun = (command, args) => {
@@ -173,10 +362,63 @@ describe('drain and health gates', () => {
     expect(progress).toEqual(['Stopping 2 NanoClaw container(s) for cutover: aaa111, bbb222']);
   });
 
+  it('keeps its inlined label contract equal to src/drivers/types.ts', () => {
+    expect(DRAIN_LIST_FORMAT).toBe(`{{.ID}}|{{.Label "${LABELS.session}"}}|{{.Label "${LABELS.role}"}}`);
+    expect(CONTROLLER_GATEWAY_ROLE).toBe(GATEWAY_ROLE);
+  });
+
+  it('leaves gateway-owned containers running through cutover', async () => {
+    // A gateway's own container carries the install label and role=gateway but
+    // no session; stopping it let the next host start reap it.
+    const root = temp();
+    const label = `nanoclaw-install=${slug(root)}`;
+    const ps = `docker ps --filter label=${label} --format ${DRAIN_LIST_FORMAT}`;
+    let stopped = false;
+    const { env, calls } = makeEnv('linux');
+    env.runner.tryRun = (command, args) => {
+      const key = `${command} ${args.join(' ')}`;
+      calls.push(key);
+      if (args[0] === 'stop') stopped = true;
+      if (key === ps)
+        return { ok: true, stdout: `${stopped ? '' : 'agent111|s1|agent\nbare444||agent\n'}gw222||gateway\n` };
+      return { ok: true, stdout: '' };
+    };
+
+    await drainContainers(root, env);
+    expect(calls).toEqual([ps, `docker stop -t ${CUTOVER_STOP_GRACE_SECONDS} agent111 bare444`, ps]);
+  });
+
+  it('still stops pre-seam containers (no session, no role)', async () => {
+    const root = temp();
+    const label = `nanoclaw-install=${slug(root)}`;
+    const ps = `docker ps --filter label=${label} --format ${DRAIN_LIST_FORMAT}`;
+    const { env, calls } = makeEnv('linux', { [ps]: { ok: true, stdout: 'old333||\n' } });
+
+    await expect(drainContainers(root, env, 0)).rejects.toThrow('old333');
+    expect(calls).toContain(`docker stop -t ${CUTOVER_STOP_GRACE_SECONDS} old333`);
+  });
+
+  it('restarts only gateway-owned containers after a snapshot restore, and never throws', () => {
+    const root = temp();
+    const label = `nanoclaw-install=${slug(root)}`;
+    const ps = `docker ps -a --filter label=${label} --format ${DRAIN_LIST_FORMAT}`;
+    const restart = `docker restart -t ${CUTOVER_STOP_GRACE_SECONDS} gw222`;
+    const { env, calls } = makeEnv('linux', {
+      [ps]: { ok: true, stdout: 'agent111|s1|agent\ngw222||gateway\nold333||\nbare444||agent\n' },
+      [restart]: { ok: false, stdout: 'daemon error' },
+    });
+    const progress: string[] = [];
+    env.log = (message) => progress.push(message);
+
+    expect(() => restartGatewayContainers(root, env)).not.toThrow();
+    expect(calls).toEqual([ps, restart]);
+    expect(progress[1]).toContain('re-run the gateway');
+  });
+
   it('tolerates a failed stop when the containers are gone anyway (exited between list and stop)', async () => {
     const root = temp();
     const label = `nanoclaw-install=${slug(root)}`;
-    const ps = `docker ps -q --filter label=${label}`;
+    const ps = `docker ps --filter label=${label} --format ${DRAIN_LIST_FORMAT}`;
     let listings = 0;
     const { env, calls } = makeEnv('linux');
     env.runner.tryRun = (command, args) => {
@@ -198,7 +440,7 @@ describe('drain and health gates', () => {
     const root = temp();
     const label = `nanoclaw-install=${slug(root)}`;
     const { env } = makeEnv('linux', {
-      [`docker ps -q --filter label=${label}`]: { ok: true, stdout: 'aaa111' },
+      [`docker ps --filter label=${label} --format ${DRAIN_LIST_FORMAT}`]: { ok: true, stdout: 'aaa111' },
       [`docker stop -t ${CUTOVER_STOP_GRACE_SECONDS} aaa111`]: { ok: false, stdout: 'permission denied' },
     });
 
@@ -213,7 +455,7 @@ describe('drain and health gates', () => {
     // open indefinitely with the service down.
     const root = temp();
     const label = `nanoclaw-install=${slug(root)}`;
-    const ps = `docker ps -q --filter label=${label}`;
+    const ps = `docker ps --filter label=${label} --format ${DRAIN_LIST_FORMAT}`;
     let clock = 1_000_000;
     const now = vi.spyOn(Date, 'now').mockImplementation(() => clock);
     try {
@@ -259,18 +501,21 @@ describe('drain and health gates', () => {
     const root = temp();
     const label = `nanoclaw-install=${slug(root)}`;
     const { env, calls } = makeEnv('linux', {
-      [`docker ps -q --filter label=${label}`]: { ok: false, stdout: 'Cannot connect to the Docker daemon' },
+      [`docker ps --filter label=${label} --format ${DRAIN_LIST_FORMAT}`]: {
+        ok: false,
+        stdout: 'Cannot connect to the Docker daemon',
+      },
     });
 
     await expect(drainContainers(root, env)).rejects.toThrow('Cannot inspect active NanoClaw containers with docker');
-    expect(calls).toEqual([`docker ps -q --filter label=${label}`]);
+    expect(calls).toEqual([`docker ps --filter label=${label} --format ${DRAIN_LIST_FORMAT}`]);
   });
 
   it('requires active process state, the ncl socket, and a successful CLI probe', async () => {
     const root = temp();
     const name = `nanoclaw-v2-${slug(root)}`;
     const { env, home } = makeEnv('linux', {
-      [`systemctl --user is-active --quiet ${name}`]: { ok: true },
+      [`systemctl --user is-active ${name}`]: { ok: true },
       [`${path.join(root, 'bin', 'ncl')} groups list`]: { ok: true },
     });
     const unit = path.join(home, '.config', 'systemd', 'user', `${name}.service`);

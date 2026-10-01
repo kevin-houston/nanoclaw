@@ -7,11 +7,12 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { getInstallSlug } from '../../../../src/install-slug.js';
-import { LABELS } from '../../../../src/drivers/types.js';
+import { GATEWAY_ROLE, LABELS } from '../../../../src/drivers/types.js';
 import { upsertEnvVar } from '../../../../setup/set-env.js';
 import { installStep, installCommand, InstallCommandFailure } from './install-command.js';
 import { buildManagedProxy, hasFrontProxy } from './build-managed-proxy.js';
 import { controlPaths, installControl, removeControl, storeModelCredential } from './control.js';
+import { checkControlEngine } from './control-preflight.js';
 import { readAllowedHostsFile, validateAllowedHost } from '../payload/src/gateway-providers/iron-proxy-allowlist.js';
 
 const pins = JSON.parse(
@@ -149,7 +150,7 @@ async function startCentralProxy(projectRoot: string): Promise<void> {
     '--label',
     centralInstallLabel(projectRoot),
     '--label',
-    `${LABELS.role}=gateway`,
+    `${LABELS.role}=${GATEWAY_ROLE}`,
     ...(uid == null ? [] : ['--user', `${uid}:${gid ?? uid}`]),
     ...centralHostGatewayArgs(),
     '--restart',
@@ -224,6 +225,9 @@ export async function run(args: string[], projectRoot = process.cwd()): Promise<
   const managed = args.includes('--with-control') || !!readProjectEnv(projectRoot).NANOCLAW_IRON_CONTROL_URL;
   const localIndex = args.indexOf('--local-image');
   if (managed || localIndex < 0) {
+    // An engine that cannot run the console stops here, before the Iron
+    // Proxy build spends minutes.
+    if (managed) await checkControlEngine();
     IMAGE = await buildManagedProxy();
     if (managed) await installControl(projectRoot);
     upsertEnvVar('NANOCLAW_IRON_PROXY_IMAGE', IMAGE, projectRoot);

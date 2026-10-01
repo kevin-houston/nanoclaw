@@ -190,7 +190,7 @@ async function performChatGptSignIn(method: ChatGptLoginMethod, root: string, va
     const secret = readOpenCodeOAuth(authJson);
     // Delete native token files before any network wait. A Ctrl-C during the
     // gateway save must not strand them when the process exits immediately.
-    // The gateway refuses the save if its entry changed since the lookup.
+    // The gateway rereads the entry and refuses a changed ID or unexpected metadata.
     fs.rmSync(loginDir, { recursive: true, force: true });
     await vault.save(secret);
   } finally {
@@ -217,6 +217,7 @@ export async function runOpenCodeAuthCli(args: string[]): Promise<void> {
 }
 
 export async function runOpenCodeAuthStep(options: { allowSkip?: boolean } = {}): Promise<void> {
+  const startedAt = Date.now();
   const backend = answer(
     await brightSelect<Backend>({
       message: 'Which model backend should OpenCode use?',
@@ -393,7 +394,7 @@ export async function runOpenCodeAuthStep(options: { allowSkip?: boolean } = {})
     else upsertEnvVar(name, value);
   }
 
-  setupLog.step('auth', 'success', 0, { PROVIDER: 'opencode', BACKEND: backend });
+  setupLog.step('auth', 'success', Date.now() - startedAt, { PROVIDER: 'opencode', BACKEND: backend });
   p.log.success(brandBody('OpenCode configured. Credentials, when supplied, live in the selected gateway.'));
 }
 
