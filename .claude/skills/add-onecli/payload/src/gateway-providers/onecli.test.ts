@@ -254,13 +254,42 @@ describe('OneCLI gateway package', () => {
     second.onUnavailable?.(unavailable);
 
     expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(unavailable).not.toHaveBeenCalled();
+
     await vi.advanceTimersByTimeAsync(5_000);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(unavailable).toHaveBeenCalledTimes(2);
     expect(vi.getTimerCount()).toBe(0);
 
     firstController.abort();
     secondController.abort();
+    fetchMock.mockRestore();
+  });
+
+  it('keeps sessions alive when a failed health probe is followed by a success', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockRejectedValueOnce(new TypeError('fetch failed'))
+      .mockRejectedValueOnce(new TypeError('fetch failed'))
+      .mockResolvedValueOnce(new Response('ok'))
+      .mockRejectedValueOnce(new TypeError('fetch failed'))
+      .mockRejectedValueOnce(new TypeError('fetch failed'))
+      .mockResolvedValue(new Response('ok'));
+    const controller = new AbortController();
+    const lease = await provider.sessions.ensure(input('s1'), controller.signal);
+    const unavailable = vi.fn();
+    lease.onUnavailable?.(unavailable);
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(fetchMock).toHaveBeenCalledTimes(6);
+    expect(unavailable).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(1);
+
+    controller.abort();
+    expect(vi.getTimerCount()).toBe(0);
     fetchMock.mockRestore();
   });
 

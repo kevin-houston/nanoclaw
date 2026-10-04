@@ -32,6 +32,9 @@ const healthUrl = new URL('/v1/health', onecliUrl || 'https://api.onecli.sh').to
 const liveLeases = new Set<{ unavailable?: string; notify?: (reason: string) => void }>();
 let healthTimer: NodeJS.Timeout | null = null;
 let probing = false;
+let healthFailures = 0;
+/** Consecutive failed 5s probes before sessions are failed closed (~15s outage). */
+const HEALTH_FAILURE_THRESHOLD = 3;
 
 type OneCLIContribution = Omit<GatewayContribution, 'networkAccess'>;
 type GatewayMount = NonNullable<GatewayContribution['mounts']>[number];
@@ -76,6 +79,14 @@ export function withProviderEnv(contribution: OneCLIContribution, baseUrl = anth
 function stopHealthMonitor(): void {
   if (healthTimer) clearInterval(healthTimer);
   healthTimer = null;
+  healthFailures = 0;
+}
+
+/** undici's "fetch failed" hides the socket-level reason in `cause`. */
+function failureCause(err: unknown): string | undefined {
+  const cause = (err as { cause?: { code?: string; message?: string } } | null)?.cause;
+  if (!cause) return undefined;
+  return [cause.code, cause.message].filter(Boolean).join(' ') || String(cause);
 }
 
 async function probeHealth(): Promise<void> {
@@ -84,9 +95,18 @@ async function probeHealth(): Promise<void> {
   try {
     const response = await fetch(healthUrl, { signal: AbortSignal.timeout(5_000) });
     if (!response.ok) throw new Error(`status ${response.status}`);
+    healthFailures = 0;
   } catch (err) {
+    // One dropped probe must not fail every session closed: the kills respawn
+    // all sessions at once, and that burst causes the next dropped probe.
+    healthFailures++;
+    const cause = failureCause(err);
+    if (healthFailures < HEALTH_FAILURE_THRESHOLD) {
+      log.warn('OneCLI health probe failed', { err, cause, failures: healthFailures });
+      return;
+    }
     const reason = 'OneCLI gateway unavailable';
-    log.error(reason, { err });
+    log.error(reason, { err, cause, failures: healthFailures });
     stopHealthMonitor();
     for (const lease of liveLeases) {
       lease.unavailable = reason;
